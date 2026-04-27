@@ -350,6 +350,8 @@ object NoteBodyEditor {
     }.getOrElse { "summarize_failed: ${it.message}" }
 
     fun summarizeBase64(textDataEncryptedB64: String): String = runCatching {
+        // TextDataEncrypted ships in either gzip or zlib (deflate); Gzip.decompress
+        // auto-detects.
         summarize(Gzip.decompress(Base64.decode(textDataEncryptedB64)))
     }.getOrElse { "summarize_b64_failed: ${it.message}" }
 

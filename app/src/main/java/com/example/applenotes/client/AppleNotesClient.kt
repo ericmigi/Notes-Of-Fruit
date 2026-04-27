@@ -251,9 +251,17 @@ class AppleNotesClient(
         if (textB64 != null) {
             val tag = if (sentB64 != null) " matchesSent=${textB64 == sentB64}" else ""
             Log.i(TAG, "$label TextDataEncrypted.b64.len=${textB64.length}$tag")
+            // Log first 32 raw bytes so we can identify the encoding (gzip
+            // magic 1f 8b, raw proto, encrypted, etc.) when summarize fails.
+            runCatching {
+                @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+                val raw = kotlin.io.encoding.Base64.decode(textB64)
+                val prefix = raw.take(32).joinToString("") {
+                    ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1)
+                }
+                Log.i(TAG, "$label TextDataEncrypted raw[0..32] hex=$prefix (totalRaw=${raw.size})")
+            }
             Log.i(TAG, "$label TextDataEncrypted proto: ${NoteBodyEditor.summarizeBase64(textB64)}")
-            // Full replica entry dump — ground-truth structure for designing
-            // our own registration. Multi-line; only logged for lookups.
             if (label == "lookupNote") {
                 Log.i(TAG, "$label replicas dump:\n${NoteBodyEditor.dumpReplicasBase64(textB64)}")
             }
