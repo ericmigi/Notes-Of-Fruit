@@ -411,6 +411,7 @@ class AppleNotesClient(
             Log.i(TAG, "$label TextDataEncrypted proto: ${NoteBodyEditor.summarizeBase64(textB64)}")
             if (label == "lookupNote") {
                 Log.i(TAG, "$label replicas dump:\n${NoteBodyEditor.dumpReplicasBase64(textB64)}")
+                Log.i(TAG, "$label attribute_runs dump:\n${NoteBodyEditor.dumpAttributeRunsBase64(textB64)}")
             }
         } else {
             Log.i(TAG, "$label has no TextDataEncrypted in returned fields (keys=${record.rawFields.keys})")

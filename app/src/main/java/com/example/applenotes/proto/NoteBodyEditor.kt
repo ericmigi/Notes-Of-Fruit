@@ -401,6 +401,55 @@ object NoteBodyEditor {
      * inner field (numbered), every counter block. Used as ground-truth to
      * design our own registration. Multi-line.
      */
+    /** Multi-line dump of every AttributeRun's inner field structure. */
+    fun dumpAttributeRunsBase64(textDataEncryptedB64: String): String = runCatching {
+        val proto = Gzip.decompress(Base64.decode(textDataEncryptedB64))
+        val top = ProtobufWire.decode(proto)
+        val docField = top.firstOrNull {
+            it.fieldNumber == FIELD_NOTESTOREPROTO_DOCUMENT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        } ?: return@runCatching "no document"
+        val docFields = ProtobufWire.decode(docField.payload)
+        val noteField = docFields.firstOrNull {
+            it.fieldNumber == FIELD_DOCUMENT_NOTE && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        } ?: return@runCatching "no note"
+        val noteFields = ProtobufWire.decode(noteField.payload)
+        val sb = StringBuilder()
+        var idx = 0
+        for (f in noteFields) {
+            if (f.fieldNumber != FIELD_NOTE_ATTRIBUTE_RUN || f.wireType != ProtobufWire.WIRE_LENGTH_DELIM) continue
+            sb.append("AR[").append(idx++).append("] sz=").append(f.payload.size).append('\n')
+            for (sub in ProtobufWire.decode(f.payload)) {
+                sb.append("  f").append(sub.fieldNumber).append("/w").append(sub.wireType)
+                    .append("/sz").append(sub.payload.size)
+                when (sub.wireType) {
+                    ProtobufWire.WIRE_VARINT -> sb.append(" v=").append(ProtobufWire.decodeVarint(sub))
+                    ProtobufWire.WIRE_LENGTH_DELIM -> {
+                        val nested = runCatching { ProtobufWire.decode(sub.payload) }.getOrNull()
+                        if (nested != null && nested.isNotEmpty()) {
+                            sb.append(" {")
+                            for ((j, nf) in nested.withIndex()) {
+                                if (j > 0) sb.append(", ")
+                                sb.append("f").append(nf.fieldNumber).append("/w").append(nf.wireType)
+                                if (nf.wireType == ProtobufWire.WIRE_VARINT) {
+                                    sb.append("=").append(ProtobufWire.decodeVarint(nf))
+                                } else {
+                                    sb.append("/sz").append(nf.payload.size)
+                                }
+                            }
+                            sb.append("}")
+                        } else if (sub.payload.size <= 32) {
+                            sb.append(" hex=").append(sub.payload.joinToString("") {
+                                ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1)
+                            })
+                        }
+                    }
+                }
+                sb.append('\n')
+            }
+        }
+        sb.toString()
+    }.getOrElse { "dump_attrs_failed: ${it.message}" }
+
     fun dumpReplicasBase64(textDataEncryptedB64: String): String = runCatching {
         val proto = Gzip.decompress(Base64.decode(textDataEncryptedB64))
         val top = ProtobufWire.decode(proto)
