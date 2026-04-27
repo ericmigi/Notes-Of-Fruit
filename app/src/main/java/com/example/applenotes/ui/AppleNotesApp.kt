@@ -27,13 +27,22 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Logout
+import androidx.compose.material.icons.automirrored.filled.Note
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.LargeTopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.foundation.layout.size
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -366,28 +375,77 @@ private fun NotesListScreen(
     onRefresh: () -> Unit,
     onSignOut: () -> Unit,
 ) {
+    var query by remember { mutableStateOf("") }
+    val filtered = remember(notes, query) {
+        if (query.isBlank()) notes
+        else notes.filter {
+            (it.title?.contains(query, ignoreCase = true) == true) ||
+                (it.snippet?.contains(query, ignoreCase = true) == true)
+        }
+    }
+    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     Scaffold(
+        modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
         topBar = {
-            TopAppBar(
-                title = { Text("Apple Notes (${notes.size})") },
+            LargeTopAppBar(
+                title = {
+                    Column {
+                        Text("Notes", style = MaterialTheme.typography.displayLarge)
+                        Text(
+                            "${notes.size} note${if (notes.size == 1) "" else "s"}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                },
                 actions = {
                     IconButton(onClick = onRefresh) {
                         Icon(Icons.Default.Refresh, contentDescription = "Refresh")
                     }
                     IconButton(onClick = onSignOut) {
-                        Icon(Icons.Default.Logout, contentDescription = "Sign out")
+                        Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = "Sign out")
                     }
                 },
+                scrollBehavior = scrollBehavior,
             )
         },
     ) { padding ->
-        if (notes.isEmpty()) {
-            EmptyState(padding, "No notes returned. Pull to refresh.")
-        } else {
-            LazyColumn(modifier = Modifier.fillMaxSize().padding(padding)) {
-                items(notes, key = { it.recordName }) { note ->
-                    NoteRow(note, onClick = { onSelect(note) })
-                    HorizontalDivider()
+        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+            // Search bar
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                placeholder = { Text("Search notes") },
+                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+                trailingIcon = {
+                    if (query.isNotEmpty()) {
+                        IconButton(onClick = { query = "" }) {
+                            Icon(Icons.Default.Close, contentDescription = "Clear")
+                        }
+                    }
+                },
+                singleLine = true,
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor = MaterialTheme.colorScheme.surface,
+                    unfocusedContainerColor = MaterialTheme.colorScheme.surface,
+                ),
+                shape = MaterialTheme.shapes.large,
+            )
+            if (filtered.isEmpty()) {
+                EmptyNotesState(query.isNotBlank())
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    items(filtered, key = { it.recordName }) { note ->
+                        NoteCard(note, onClick = { onSelect(note) })
+                    }
+                    item { Spacer(Modifier.height(80.dp)) } // FAB clearance
                 }
             }
         }
@@ -395,48 +453,81 @@ private fun NotesListScreen(
 }
 
 @Composable
-private fun EmptyState(padding: PaddingValues, msg: String) {
-    Box(modifier = Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
-        Text(msg, style = MaterialTheme.typography.bodyMedium)
+private fun EmptyNotesState(filtering: Boolean) {
+    Column(
+        modifier = Modifier.fillMaxSize().padding(32.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Icon(
+            Icons.AutoMirrored.Filled.Note,
+            contentDescription = null,
+            modifier = Modifier.size(64.dp),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(12.dp))
+        Text(
+            if (filtering) "No notes match your search." else "No notes yet.",
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (!filtering) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Create one on Mac or iCloud.com — it'll show up here.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun NoteRow(note: NoteSummary, onClick: () -> Unit) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickableRow(onClick)
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+private fun NoteCard(note: NoteSummary, onClick: () -> Unit) {
+    Card(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface,
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        shape = MaterialTheme.shapes.large,
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
+        Column(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             Text(
-                text = note.title?.takeIf { it.isNotBlank() } ?: "(untitled)",
+                text = note.title?.takeIf { it.isNotBlank() } ?: "Untitled",
                 style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Medium,
-                modifier = Modifier.weight(1f),
+                fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.onSurface,
             )
-            note.modificationTimestampMs?.let { ts ->
-                Text(
-                    text = humanRelative(ts),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                note.modificationTimestampMs?.let { ts ->
+                    Text(
+                        text = humanRelative(ts),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.secondary,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+                if (!note.snippet.isNullOrBlank()) {
+                    Text(
+                        text = note.snippet,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
-        }
-        if (!note.snippet.isNullOrBlank()) {
-            Text(
-                text = note.snippet,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
         }
     }
 }
@@ -574,8 +665,9 @@ private fun NoteDetailScreen(
                 value = bodyDraft,
                 onValueChange = { bodyDraft = it },
                 modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 16.dp),
                 textStyle = MaterialTheme.typography.bodyLarge.copy(
                     color = MaterialTheme.colorScheme.onSurface,
                 ),
@@ -593,6 +685,27 @@ private fun NoteDetailScreen(
                     inner()
                 },
             )
+            // Footer: modification date + char count + chord guidance.
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                val modDate = record.stringField("ModificationDate")?.toLongOrNull()
+                Text(
+                    text = modDate?.let { "Modified ${humanRelative(it)}" } ?: "—",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = "${bodyDraft.length} chars",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 
