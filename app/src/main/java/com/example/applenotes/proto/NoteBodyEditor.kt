@@ -248,6 +248,102 @@ object NoteBodyEditor {
         return readText(Gzip.decompress(compressed))
     }
 
+    /**
+     * One-line structural summary of the proto bytes for diagnostic logging.
+     * Goal: see at a glance whether ops/replicas/attribute_runs look sane and
+     * whether the editing replica index we forge matches the replica registry.
+     */
+    fun summarize(noteStoreProtoBytes: ByteArray): String = runCatching {
+        val sb = StringBuilder()
+        val kind = probe(noteStoreProtoBytes)
+        sb.append("kind=").append(kind)
+        sb.append(" bytes=").append(noteStoreProtoBytes.size)
+        val top = ProtobufWire.decode(noteStoreProtoBytes)
+        val docField = top.firstOrNull {
+            it.fieldNumber == FIELD_NOTESTOREPROTO_DOCUMENT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        } ?: return@runCatching sb.append(" (no document)").toString()
+        val docFields = ProtobufWire.decode(docField.payload)
+        val noteField = docFields.firstOrNull {
+            it.fieldNumber == FIELD_DOCUMENT_NOTE && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        } ?: return@runCatching sb.append(" (no note)").toString()
+        val noteFields = ProtobufWire.decode(noteField.payload)
+
+        val textField = noteFields.firstOrNull {
+            it.fieldNumber == FIELD_NOTE_TEXT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        sb.append(" text.bytes=").append(textField?.payload?.size ?: 0)
+
+        val opFields = noteFields.filter {
+            it.fieldNumber == 3 && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        sb.append(" ops=").append(opFields.size).append('[')
+        for ((i, op) in opFields.withIndex()) {
+            if (i > 0) sb.append(',')
+            val sub = ProtobufWire.decode(op.payload)
+            val from = sub.firstOrNull {
+                it.fieldNumber == 1 && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }?.let { ProtobufWire.decode(it.payload) }
+            val rid = from?.firstOrNull {
+                it.fieldNumber == 1 && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) }
+            val off = from?.firstOrNull {
+                it.fieldNumber == 2 && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) }
+            val f2 = sub.firstOrNull {
+                it.fieldNumber == 2 && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) }
+            val seq = sub.firstOrNull {
+                it.fieldNumber == 5 && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) }
+            sb.append("rid=").append(rid)
+                .append("/off=").append(off)
+                .append("/len=").append(f2)
+                .append("/seq=").append(seq)
+        }
+        sb.append(']')
+
+        val replicaField = noteFields.firstOrNull {
+            it.fieldNumber == 4 && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        if (replicaField != null) {
+            val replicas = ProtobufWire.decode(replicaField.payload)
+                .filter { it.fieldNumber == 1 && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM }
+            sb.append(" replicas=").append(replicas.size).append('[')
+            for ((i, ent) in replicas.withIndex()) {
+                if (i > 0) sb.append(',')
+                val es = ProtobufWire.decode(ent.payload)
+                val uuidPrefix = es.firstOrNull {
+                    it.fieldNumber == 1 && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+                }?.payload?.take(4)?.joinToString("") {
+                    ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1)
+                } ?: "????"
+                val counters = es.filter {
+                    it.fieldNumber == 2 && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+                }.mapNotNull { cb ->
+                    val cs = ProtobufWire.decode(cb.payload)
+                    cs.firstOrNull {
+                        it.fieldNumber == 1 && it.wireType == ProtobufWire.WIRE_VARINT
+                    }?.let { ProtobufWire.decodeVarint(it) }
+                }
+                sb.append('#').append(i + 1).append('(').append(uuidPrefix).append(")=")
+                    .append(counters.joinToString("/"))
+            }
+            sb.append(']')
+        } else {
+            sb.append(" replicas=null")
+        }
+
+        val attrRunCount = noteFields.count {
+            it.fieldNumber == FIELD_NOTE_ATTRIBUTE_RUN && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        sb.append(" attr_runs=").append(attrRunCount)
+        sb.toString()
+    }.getOrElse { "summarize_failed: ${it.message}" }
+
+    fun summarizeBase64(textDataEncryptedB64: String): String = runCatching {
+        summarize(Gzip.decompress(Base64.decode(textDataEncryptedB64)))
+    }.getOrElse { "summarize_b64_failed: ${it.message}" }
+
     /** What to insert and where. */
     data class Mutation(val prepend: String = "", val append: String = "")
 

@@ -67,6 +67,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -79,6 +80,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.applenotes.auth.AppleNotesSession
 import com.example.applenotes.auth.CookieReader
+import com.example.applenotes.auth.DeviceIdentity
 import com.example.applenotes.auth.ICloudSession
 import com.example.applenotes.auth.USER_AGENT
 import com.example.applenotes.client.AppleNotesClient
@@ -104,6 +106,7 @@ private sealed interface ScreenState {
 
 @Composable
 fun AppleNotesApp() {
+    val context = LocalContext.current
     val cookieReader = remember { CookieReader() }
     val httpClient = remember {
         HttpClient(OkHttp) {
@@ -113,7 +116,17 @@ fun AppleNotesApp() {
 
     var state by remember { mutableStateOf<ScreenState>(ScreenState.Splash) }
     var saving by remember { mutableStateOf(false) }
+    var ourReplicaUuid by remember { mutableStateOf<ByteArray?>(null) }
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        // Load (or generate on first run) our stable per-device replica UUID.
+        // Same UUID for every note we ever edit on this install; getting a
+        // fresh one every session would burn through Apple's per-note replica cap.
+        val uuid = DeviceIdentity.getOrCreate(context)
+        ourReplicaUuid = uuid
+        Log.i(TAG, "device replica uuid=${DeviceIdentity.hexEncode(uuid)}")
+    }
 
     suspend fun bootstrap(): ScreenState = try {
         val session = AppleNotesSession(httpClient, cookieReader).bootstrap().getOrThrow()
@@ -213,24 +226,25 @@ fun AppleNotesApp() {
                 scope.launch {
                     saving = true
                     try {
+                        val uuid = ourReplicaUuid
+                            ?: error("Device replica UUID not loaded yet — try again in a moment.")
                         val tag = s.record.recordChangeTag
                             ?: error("No recordChangeTag — refresh first.")
                         val textB64 = s.record.stringField("TextDataEncrypted")
                             ?: error("No body field on this note.")
                         val originalBody = NoteBodyEditor.readTextFromBase64(textB64).orEmpty()
                         val now = System.currentTimeMillis() / 1000L
-                        val newB64 = if (isPureAppend) {
-                            // safe path: extend last run via NoteAppender
-                            val appended = newBody.removePrefix(originalBody)
-                            require(appended.isNotEmpty()) { "Pure-append marked but no new chars" }
-                            NoteAppender.appendBase64(textB64, appended, now)
-                        } else {
-                            // Rewrite path: build a fresh minimal NoteStoreProto (no CRDT history).
-                            // The server-side note record is replaced wholesale; Apple Notes
-                            // clients treat this as a clean document going forward. Loses
-                            // formatting + cross-device CRDT sync history but renders cleanly.
-                            NoteBodyEditor.buildPlainTextBase64(newBody)
+                        // Only pure-append edits are CRDT-safe with the current implementation.
+                        // Mid-string edits and deletions need tombstone-op semantics that aren't
+                        // publicly reverse-engineered yet; corrupting the CRDT trashes the note
+                        // across every device that has it. Refuse loudly instead.
+                        check(isPureAppend) {
+                            "Only pure-append edits are supported. Mid-string changes and " +
+                                "deletions need CRDT tombstone ops which aren't implemented yet."
                         }
+                        val appended = newBody.removePrefix(originalBody)
+                        require(appended.isNotEmpty()) { "Pure-append marked but no new chars" }
+                        val newB64 = NoteAppender.appendBase64(textB64, uuid, appended, now)
                         val updated = AppleNotesClient(httpClient, s.session)
                             .modifyNoteBody(s.record.recordName, tag, newB64)
                         state = ScreenState.Detail(s.session, updated)
@@ -471,7 +485,7 @@ private fun NoteDetailScreen(
                     actions = {
                         if (isModified) {
                             IconButton(
-                                enabled = !saving,
+                                enabled = !saving && isPureAppend,
                                 onClick = { onSave(bodyDraft, isPureAppend) },
                             ) {
                                 Icon(Icons.Default.Check, contentDescription = "Save")
@@ -502,12 +516,13 @@ private fun NoteDetailScreen(
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(MaterialTheme.colorScheme.tertiaryContainer)
+                        .background(MaterialTheme.colorScheme.errorContainer)
                         .padding(horizontal = 16.dp, vertical = 8.dp),
                 ) {
                     Text(
-                        "Saving will rebuild the body's CRDT op log (loses cross-device formatting metadata). " +
-                            "iCloud Notes will still render the text correctly.",
+                        "Only pure-append edits can be saved right now. Mid-string edits and " +
+                            "deletions need CRDT tombstone ops that aren't implemented yet — " +
+                            "saving them would corrupt the note across all your devices.",
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }

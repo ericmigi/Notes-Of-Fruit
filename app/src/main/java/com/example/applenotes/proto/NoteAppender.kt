@@ -7,341 +7,484 @@ import kotlin.io.encoding.ExperimentalEncodingApi
 private const val TAG = "AppleNotesAppender"
 
 /**
- * Append plain text to the end of a Note's body proto using the in-session
- * extension pattern observed in iCloud Notes.
+ * Append plain text to the end of a Note's body proto, respecting Apple Notes'
+ * "topotext" sequence CRDT.
  *
  * For each character appended:
- *  - note_text (Note.field 2) grows by N UTF-8 bytes
- *  - CRDT op log (Note.field 3): the LAST non-sentinel op's `f2` (count varint)
- *    increments by N. No new op created.
- *  - Replica registry (Note.field 4): editing replica's first counter += N
- *  - attribute_run (Note.field 5): N new entries appended, each
- *      { field 1 = 1, field 2 = { field 9 = <font UUID copied from existing> },
- *        field 13 = <current Unix epoch seconds> }
+ *  - note_text (Note.field 2) grows by N UTF-8 bytes.
+ *  - A NEW run op is INSERTED before the sentinel (Note.field 3, repeated):
+ *      { from = (myReplicaIdx, myCounter),    // CharIDs of the new run
+ *        count = N,
+ *        to   = (anchorReplicaIdx, anchorClock),
+ *        seq  = maxSeqInDoc + 1 }
+ *    The "to" anchors the new run to the last visible CharID in the document
+ *    (= the last CharID of the penultimate op). For an empty doc, anchor to
+ *    (0, 0) — the implicit document-start sentinel.
+ *  - Replica registry (Note.field 4): if our UUID is already registered, bump
+ *    our entry's first counter by N. If not, append a fresh entry at the end
+ *    of the list (UUID + counter=0), THEN bump it by N. Our 1-based replica
+ *    index is the position in the entry list.
+ *  - attribute_run (Note.field 5): N new entries appended, each length=1 with
+ *    the font UUID copied from any existing run.
  *
- * `ReplicaIDToNotesVersionDataEncrypted` (the sibling CloudKit field) does NOT
- * need to be touched — it stays unchanged on body edits, per RE.
+ * What the previous version got wrong: it bumped the FIRST replica's counter
+ * (which was almost certainly a Mac/iPhone, not us) and built ops with
+ * `replicaIdx = 1` hardcoded. That forged Mac's identity in the CRDT history;
+ * Mac eventually noticed and refused to merge, leaving devices diverged.
  */
 @OptIn(ExperimentalEncodingApi::class)
 object NoteAppender {
 
     private const val FIELD_NOTESTOREPROTO_DOCUMENT = 2
     private const val FIELD_DOCUMENT_NOTE = 3
+
     private const val FIELD_NOTE_TEXT = 2
     private const val FIELD_NOTE_OPS = 3
     private const val FIELD_NOTE_REPLICAS = 4
     private const val FIELD_NOTE_ATTRIBUTE_RUN = 5
 
-    private const val FIELD_OP_F2_COUNT = 2
-    private const val FIELD_OP_F1_FROM_OFFSET_INT = 4294967295L  // sentinel marker
+    private const val FIELD_OP_FROM = 1
+    private const val FIELD_OP_COUNT = 2
+    private const val FIELD_OP_TO = 3
+    private const val FIELD_OP_SEQ = 5
 
-    private const val FIELD_REPLICA_ENTRY = 1
-    private const val FIELD_REPLICA_COUNTER_BLOCK = 2
-    private const val FIELD_REPLICA_COUNTER_VALUE = 1
+    private const val FIELD_CHARID_REPLICA = 1
+    private const val FIELD_CHARID_CLOCK = 2
+
+    // Note.replicas is a wrapper message; each replica entry uses field number 1
+    // in the wrapper. Inside an entry: field 1 = UUID (16 bytes), field 2
+    // (repeated, length-delim) = counter blocks. Inside a counter block:
+    // field 1 (varint) = counter value.
+    private const val FIELD_REPLICAS_LIST_ENTRY = 1
+    private const val FIELD_REPLICA_ENTRY_UUID = 1
+    private const val FIELD_REPLICA_ENTRY_COUNTER_BLOCK = 2
+    private const val FIELD_COUNTER_BLOCK_VALUE = 1
 
     private const val FIELD_ATTR_LENGTH = 1
     private const val FIELD_ATTR_FONT = 2
     private const val FIELD_FONT_UUID = 9
     private const val FIELD_ATTR_TIMESTAMP = 13
 
-    /** Decode → mutate → re-encode. Throws if the proto shape doesn't match expectations. */
-    fun appendBase64(textDataEncryptedB64: String, text: String, nowEpochSec: Long): String {
+    fun appendBase64(
+        textDataEncryptedB64: String,
+        ourReplicaUuid: ByteArray,
+        text: String,
+        nowEpochSec: Long,
+    ): String {
         require(text.isNotEmpty()) { "Empty append" }
+        require(ourReplicaUuid.size == 16) {
+            "ourReplicaUuid must be 16 bytes, got ${ourReplicaUuid.size}"
+        }
         val compressed = Base64.decode(textDataEncryptedB64)
         val proto = Gzip.decompress(compressed)
-        Log.i(TAG, "appendBase64 IN: text='${text.take(40)}' textLen=${text.length} protoLen=${proto.size}")
-        val newProto = appendBytes(proto, text, nowEpochSec)
+        Log.i(TAG, "appendBase64 IN: textLen=${text.length} protoLen=${proto.size}")
+        Log.i(TAG, "appendBase64 IN  proto: ${NoteBodyEditor.summarize(proto)}")
+        val newProto = appendBytes(proto, ourReplicaUuid, text, nowEpochSec)
+        Log.i(TAG, "appendBase64 OUT proto: ${NoteBodyEditor.summarize(newProto)}")
         val newCompressed = Gzip.compress(newProto)
         val newB64 = Base64.encode(newCompressed)
         Log.i(TAG, "appendBase64 OUT: protoLen=${newProto.size} b64Len=${newB64.length}")
         return newB64
     }
 
-    /** Operates on the decompressed proto bytes. Exposed for testing. */
-    fun appendBytes(noteStoreProtoBytes: ByteArray, text: String, nowEpochSec: Long): ByteArray {
-        val top = ProtobufWire.decode(noteStoreProtoBytes)
-        val docFieldIdx = top.indexOfFirst {
+    fun appendBytes(
+        noteStoreProtoBytes: ByteArray,
+        ourReplicaUuid: ByteArray,
+        text: String,
+        nowEpochSec: Long,
+    ): ByteArray {
+        require(text.isNotEmpty()) { "Empty append" }
+        require(ourReplicaUuid.size == 16) { "ourReplicaUuid must be 16 bytes" }
+
+        val kind = NoteBodyEditor.probe(noteStoreProtoBytes)
+        require(kind == NoteProtoKind.NOTE_STORE_PROTO) {
+            "Cannot append to a $kind note (modern collaborative MergableData). Not yet supported."
+        }
+
+        // ----- Decode top-level: NoteStoreProto → Document → Note -----
+        val top = ProtobufWire.decode(noteStoreProtoBytes).toMutableList()
+        val docIdx = top.indexOfFirst {
             it.fieldNumber == FIELD_NOTESTOREPROTO_DOCUMENT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
         }
-        require(docFieldIdx >= 0) { "Missing top-level Document field" }
-        val docFields = ProtobufWire.decode(top[docFieldIdx].payload).toMutableList()
-
+        require(docIdx >= 0) { "Missing NoteStoreProto.Document" }
+        val docFields = ProtobufWire.decode(top[docIdx].payload).toMutableList()
         val noteIdx = docFields.indexOfFirst {
             it.fieldNumber == FIELD_DOCUMENT_NOTE && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
         }
-        require(noteIdx >= 0) { "Missing Document.Note field" }
+        require(noteIdx >= 0) { "Missing Document.Note" }
         val noteFields = ProtobufWire.decode(docFields[noteIdx].payload).toMutableList()
 
-        val n = text.length
+        val n = text.length // Kotlin String.length is # of UTF-16 code units (= NSString length)
         val newBytes = text.encodeToByteArray()
 
-        // 1. Append to note_text (Note.field 2, string)
-        val noteTextIdx = noteFields.indexOfFirst {
-            it.fieldNumber == FIELD_NOTE_TEXT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-        }
-        require(noteTextIdx >= 0) { "Missing Note.note_text field" }
-        val oldNoteText = noteFields[noteTextIdx].payload
-        val newNoteText = oldNoteText + newBytes
-        noteFields[noteTextIdx] = noteFields[noteTextIdx].copy(payload = newNoteText)
-        Log.i(TAG, "step 1: note_text ${oldNoteText.size} -> ${newNoteText.size} bytes")
-
-        // 2. Bump f2 of LAST non-sentinel CRDT op (Note.field 3)
-        val opIndices = noteFields.withIndex()
-            .filter { it.value.fieldNumber == FIELD_NOTE_OPS && it.value.wireType == ProtobufWire.WIRE_LENGTH_DELIM }
-            .map { it.index }
-        require(opIndices.size >= 2) { "Need at least 2 ops (one + sentinel), have ${opIndices.size}" }
-        // Sentinel is the last; we want the one before.
-        val targetOpIdx = opIndices[opIndices.size - 2]
-        val opSubfields = ProtobufWire.decode(noteFields[targetOpIdx].payload).toMutableList()
-        val f2Idx = opSubfields.indexOfFirst {
-            it.fieldNumber == FIELD_OP_F2_COUNT && it.wireType == ProtobufWire.WIRE_VARINT
-        }
-        require(f2Idx >= 0) { "Op missing field 2 (count)" }
-        val oldF2 = ProtobufWire.decodeVarint(opSubfields[f2Idx])
-        val newF2 = oldF2 + n
-        opSubfields[f2Idx] = ProtobufWire.encodeVarintField(FIELD_OP_F2_COUNT, newF2)
-        noteFields[targetOpIdx] = noteFields[targetOpIdx].copy(payload = ProtobufWire.encode(opSubfields))
-        Log.i(TAG, "step 2: last op f2 $oldF2 -> $newF2")
-
-        // 3. Bump first replica's first counter in Note.field 4
+        // ----- Step 1: scan replica registry, find-or-register OUR identity -----
         val replicasIdx = noteFields.indexOfFirst {
             it.fieldNumber == FIELD_NOTE_REPLICAS && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
         }
-        require(replicasIdx >= 0) { "Missing Note.replicas field" }
-        val replicaFields = ProtobufWire.decode(noteFields[replicasIdx].payload).toMutableList()
-        val firstReplicaEntryIdx = replicaFields.indexOfFirst {
-            it.fieldNumber == FIELD_REPLICA_ENTRY && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-        }
-        require(firstReplicaEntryIdx >= 0) { "No replicas registered" }
-        val replicaEntrySubfields = ProtobufWire.decode(replicaFields[firstReplicaEntryIdx].payload).toMutableList()
-        val firstCounterBlockIdx = replicaEntrySubfields.indexOfFirst {
-            it.fieldNumber == FIELD_REPLICA_COUNTER_BLOCK && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-        }
-        require(firstCounterBlockIdx >= 0) { "Replica entry has no counter block" }
-        val counterFields = ProtobufWire.decode(replicaEntrySubfields[firstCounterBlockIdx].payload).toMutableList()
-        val counterValueIdx = counterFields.indexOfFirst {
-            it.fieldNumber == FIELD_REPLICA_COUNTER_VALUE && it.wireType == ProtobufWire.WIRE_VARINT
-        }
-        require(counterValueIdx >= 0) { "Counter block has no value field" }
-        val oldCounter = ProtobufWire.decodeVarint(counterFields[counterValueIdx])
-        val newCounter = oldCounter + n
-        counterFields[counterValueIdx] = ProtobufWire.encodeVarintField(FIELD_REPLICA_COUNTER_VALUE, newCounter)
-        replicaEntrySubfields[firstCounterBlockIdx] =
-            replicaEntrySubfields[firstCounterBlockIdx].copy(payload = ProtobufWire.encode(counterFields))
-        replicaFields[firstReplicaEntryIdx] =
-            replicaFields[firstReplicaEntryIdx].copy(payload = ProtobufWire.encode(replicaEntrySubfields))
-        noteFields[replicasIdx] = noteFields[replicasIdx].copy(payload = ProtobufWire.encode(replicaFields))
-        Log.i(TAG, "step 3: replica1 counter[0] $oldCounter -> $newCounter")
+        require(replicasIdx >= 0) { "Note has no replicas field (field 4)" }
+        val replicaList = ProtobufWire.decode(noteFields[replicasIdx].payload).toMutableList()
+        val scan = scanReplicas(replicaList, ourReplicaUuid)
 
-        // 4. Get font UUID from any existing attribute_run; fallback to zeros if none.
-        val existingAttrRunIndices = noteFields.withIndex()
-            .filter { it.value.fieldNumber == FIELD_NOTE_ATTRIBUTE_RUN && it.value.wireType == ProtobufWire.WIRE_LENGTH_DELIM }
-            .map { it.index }
-        val fontUuid: ByteArray = run {
-            for (idx in existingAttrRunIndices) {
-                val subs = ProtobufWire.decode(noteFields[idx].payload)
-                val fontField = subs.firstOrNull {
-                    it.fieldNumber == FIELD_ATTR_FONT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-                } ?: continue
-                val fontSubs = ProtobufWire.decode(fontField.payload)
-                val uuidField = fontSubs.firstOrNull {
-                    it.fieldNumber == FIELD_FONT_UUID && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-                }
-                if (uuidField != null && uuidField.payload.size == 16) {
-                    return@run uuidField.payload
-                }
-            }
-            ByteArray(16)
+        var ourReplicaIndex = scan.ourIndex1Based
+        var ourCounter = scan.ourCounter
+        val ourEntryListIdx: Int
+
+        if (scan.ourIndex1Based < 0) {
+            // Our UUID is NOT in the registry — register at the end. The new
+            // entry's 1-based position becomes our replica index, and existing
+            // replicas keep their indexes (since we append).
+            val counterBlock = listOf(ProtobufWire.encodeVarintField(FIELD_COUNTER_BLOCK_VALUE, 0L))
+            val newEntryFields = listOf(
+                ProtobufWire.Field(
+                    FIELD_REPLICA_ENTRY_UUID,
+                    ProtobufWire.WIRE_LENGTH_DELIM,
+                    ourReplicaUuid,
+                ),
+                ProtobufWire.Field(
+                    FIELD_REPLICA_ENTRY_COUNTER_BLOCK,
+                    ProtobufWire.WIRE_LENGTH_DELIM,
+                    ProtobufWire.encode(counterBlock),
+                ),
+            )
+            val newEntry = ProtobufWire.Field(
+                FIELD_REPLICAS_LIST_ENTRY,
+                ProtobufWire.WIRE_LENGTH_DELIM,
+                ProtobufWire.encode(newEntryFields),
+            )
+            ourEntryListIdx = replicaList.size
+            replicaList.add(newEntry)
+            ourReplicaIndex = scan.totalEntries + 1
+            ourCounter = 0L
+            Log.i(
+                TAG,
+                "REGISTERED new replica: idx=$ourReplicaIndex uuid=${hex(ourReplicaUuid)} " +
+                    "(coexists with ${scan.totalEntries} existing replicas)",
+            )
+        } else {
+            ourEntryListIdx = scan.ourListIdx
+            Log.i(
+                TAG,
+                "MATCHED existing replica: idx=$ourReplicaIndex counter=$ourCounter " +
+                    "uuid=${hex(ourReplicaUuid)} (this device has edited this note before)",
+            )
         }
-        Log.i(TAG, "step 4: font UUID hex=${fontUuid.joinToString("") { ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1) }}")
 
-        // 5. Append N new attribute_run entries.
-        repeat(n) { i ->
-            val newRun = buildAttributeRun(length = 1, fontUuid = fontUuid, ts = nowEpochSec + i)
-            noteFields.add(newRun)
-        }
-        Log.i(TAG, "step 5: appended $n attribute_run entries")
-
-        // 6. Re-encode bottom-up.
-        docFields[noteIdx] = docFields[noteIdx].copy(payload = ProtobufWire.encode(noteFields))
-        top[docFieldIdx] = top[docFieldIdx].copy(payload = ProtobufWire.encode(docFields))
-        return ProtobufWire.encode(top)
-    }
-
-    /**
-     * Rewrite the body to `newText` while preserving the existing replicas + sentinel
-     * structure. Used when the user makes a non-append edit (mid-string, delete, etc.)
-     * where simple `f2++` won't work.
-     *
-     * Strategy: keep field 4 (replicas) intact, drop all field 3 ops EXCEPT the sentinel,
-     * and prepend ONE new run op that "owns" the entire new text. That makes our replica
-     * the sole author of the document from iCloud Notes' perspective. Other devices
-     * that try to merge will see a clean linear text — they may diverge but at minimum
-     * it renders cleanly.
-     */
-    fun rewriteToTextBase64(textDataEncryptedB64: String, newText: String, nowEpochSec: Long): String {
-        val compressed = Base64.decode(textDataEncryptedB64)
-        val proto = Gzip.decompress(compressed)
-        Log.i(TAG, "rewriteToTextBase64 IN: newLen=${newText.length} protoLen=${proto.size}")
-        val newProto = rewriteToTextBytes(proto, newText, nowEpochSec)
-        val newCompressed = Gzip.compress(newProto)
-        val newB64 = Base64.encode(newCompressed)
-        Log.i(TAG, "rewriteToTextBase64 OUT: protoLen=${newProto.size} b64Len=${newB64.length}")
-        return newB64
-    }
-
-    fun rewriteToTextBytes(noteStoreProtoBytes: ByteArray, newText: String, nowEpochSec: Long): ByteArray {
-        val top = ProtobufWire.decode(noteStoreProtoBytes)
-        val docFieldIdx = top.indexOfFirst {
-            it.fieldNumber == FIELD_NOTESTOREPROTO_DOCUMENT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-        }
-        require(docFieldIdx >= 0) { "Missing top-level Document field" }
-        val docFields = ProtobufWire.decode(top[docFieldIdx].payload).toMutableList()
-        val noteIdx = docFields.indexOfFirst {
-            it.fieldNumber == FIELD_DOCUMENT_NOTE && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-        }
-        require(noteIdx >= 0) { "Missing Document.Note field" }
-        val noteFields = ProtobufWire.decode(docFields[noteIdx].payload).toMutableList()
-
-        val n = newText.length
-        val newBytes = newText.encodeToByteArray()
-
-        // 1. Replace note_text wholesale.
-        val noteTextIdx = noteFields.indexOfFirst {
-            it.fieldNumber == FIELD_NOTE_TEXT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-        }
-        require(noteTextIdx >= 0) { "Missing Note.note_text field" }
-        noteFields[noteTextIdx] = noteFields[noteTextIdx].copy(payload = newBytes)
-        Log.i(TAG, "rewrite step 1: note_text -> ${newBytes.size} bytes")
-
-        // 2. Drop all field 3 (CRDT op log) entries. Keep one new run op + the sentinel.
-        // Capture the sentinel before we drop, so we can put it back at the same relative position.
+        // ----- Step 2: compute max seq + last visible CharID across the op log -----
         val opEntries = noteFields.withIndex()
             .filter { it.value.fieldNumber == FIELD_NOTE_OPS && it.value.wireType == ProtobufWire.WIRE_LENGTH_DELIM }
-        val sentinelOpField = opEntries.lastOrNull()?.value
-            ?: error("No CRDT ops found at all — note proto is unexpected")
-        // Verify it really is the sentinel.
-        require(ProtobufWire.encode(listOf(sentinelOpField)).any { true }) { "sentinel detection failed" }
-        val firstOpInsertionIdx = opEntries.first().index
-        // Remove ALL existing op entries (we'll re-insert).
-        for (entry in opEntries.reversed()) {
-            noteFields.removeAt(entry.index)
-        }
-        // Build a new run op that owns all `n` chars: from=(replica1, oldCounter), f2=n, to=(0,0), seq=1
-        // We'll figure out replica1's counter[0] by reading field 4 below; for now use placeholder
-        // and patch after step 3.
-        Log.i(TAG, "rewrite step 2: dropped ${opEntries.size} ops")
+        require(opEntries.isNotEmpty()) { "Note has no ops at all (no sentinel)" }
 
-        // 3. Read replica 1 counter[0] (so the new op references valid offsets), then bump it by n.
-        val replicasIdx = noteFields.indexOfFirst {
-            it.fieldNumber == FIELD_NOTE_REPLICAS && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        var maxSeq = 0L
+        for (entry in opEntries) {
+            val sub = ProtobufWire.decode(entry.value.payload)
+            val seq = sub.firstOrNull {
+                it.fieldNumber == FIELD_OP_SEQ && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+            if (seq > maxSeq) maxSeq = seq
         }
-        require(replicasIdx >= 0) { "Missing Note.replicas field" }
-        val replicaFields = ProtobufWire.decode(noteFields[replicasIdx].payload).toMutableList()
-        val firstReplicaEntryIdx = replicaFields.indexOfFirst {
-            it.fieldNumber == FIELD_REPLICA_ENTRY && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-        }
-        require(firstReplicaEntryIdx >= 0) { "No replicas registered" }
-        val replicaEntrySubfields = ProtobufWire.decode(replicaFields[firstReplicaEntryIdx].payload).toMutableList()
-        val firstCounterBlockIdx = replicaEntrySubfields.indexOfFirst {
-            it.fieldNumber == FIELD_REPLICA_COUNTER_BLOCK && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-        }
-        require(firstCounterBlockIdx >= 0) { "Replica entry has no counter block" }
-        val counterFields = ProtobufWire.decode(replicaEntrySubfields[firstCounterBlockIdx].payload).toMutableList()
-        val counterValueIdx = counterFields.indexOfFirst {
-            it.fieldNumber == FIELD_REPLICA_COUNTER_VALUE && it.wireType == ProtobufWire.WIRE_VARINT
-        }
-        require(counterValueIdx >= 0) { "Counter block has no value field" }
-        val oldCounter = ProtobufWire.decodeVarint(counterFields[counterValueIdx])
-        val newCounter = oldCounter + n
-        counterFields[counterValueIdx] = ProtobufWire.encodeVarintField(FIELD_REPLICA_COUNTER_VALUE, newCounter)
-        replicaEntrySubfields[firstCounterBlockIdx] =
-            replicaEntrySubfields[firstCounterBlockIdx].copy(payload = ProtobufWire.encode(counterFields))
-        replicaFields[firstReplicaEntryIdx] =
-            replicaFields[firstReplicaEntryIdx].copy(payload = ProtobufWire.encode(replicaEntrySubfields))
-        noteFields[replicasIdx] = noteFields[replicasIdx].copy(payload = ProtobufWire.encode(replicaFields))
-        Log.i(TAG, "rewrite step 3: replica1 counter[0] $oldCounter -> $newCounter")
 
-        // 4. Insert the new run op BEFORE the sentinel, plus the sentinel itself.
-        // The replica index in ops is 1-indexed (first replica = 1).
-        val newRunOp = buildRunOp(replicaIdx = 1, fromOffset = oldCounter, length = n.toLong(), seq = 1)
-        // Insert at the position where the original first op was (which is now empty).
-        // After the removal, that idx still points to a sensible insertion point.
-        noteFields.add(firstOpInsertionIdx, newRunOp)
-        noteFields.add(firstOpInsertionIdx + 1, sentinelOpField)
-        Log.i(TAG, "rewrite step 4: inserted 1 new run op + sentinel")
-
-        // 5. Drop ALL existing attribute_run entries, append N new ones (single run = single style).
-        val existingAttrRunIndices = noteFields.withIndex()
-            .filter { it.value.fieldNumber == FIELD_NOTE_ATTRIBUTE_RUN && it.value.wireType == ProtobufWire.WIRE_LENGTH_DELIM }
-            .map { it.index }
-        // Capture font UUID before removing.
-        val fontUuid: ByteArray = run {
-            for (idx in existingAttrRunIndices) {
-                val subs = ProtobufWire.decode(noteFields[idx].payload)
-                val fontField = subs.firstOrNull {
-                    it.fieldNumber == FIELD_ATTR_FONT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-                } ?: continue
-                val fontSubs = ProtobufWire.decode(fontField.payload)
-                val uuidField = fontSubs.firstOrNull {
-                    it.fieldNumber == FIELD_FONT_UUID && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-                }
-                if (uuidField != null && uuidField.payload.size == 16) {
-                    return@run uuidField.payload
-                }
-            }
-            ByteArray(16)
+        // The sentinel is the last op. Anchor the new run to the LAST CharID of
+        // the penultimate op (the most recently authored character). If the only
+        // op is the sentinel, anchor to (0, 0) which is the document-start.
+        var anchorReplica = 0L
+        var anchorClock = 0L
+        if (opEntries.size >= 2) {
+            val penultimate = opEntries[opEntries.size - 2].value
+            val sub = ProtobufWire.decode(penultimate.payload)
+            val from = sub.firstOrNull {
+                it.fieldNumber == FIELD_OP_FROM && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }?.let { ProtobufWire.decode(it.payload) }
+            val rid = from?.firstOrNull {
+                it.fieldNumber == FIELD_CHARID_REPLICA && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+            val off = from?.firstOrNull {
+                it.fieldNumber == FIELD_CHARID_CLOCK && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+            val count = sub.firstOrNull {
+                it.fieldNumber == FIELD_OP_COUNT && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+            anchorReplica = rid
+            anchorClock = if (count > 0) off + count - 1 else off
         }
-        for (idx in existingAttrRunIndices.reversed()) {
-            noteFields.removeAt(idx)
+        // Multi-replica safety check: anchoring to the penultimate op's last CharID
+        // is only sound when the op-log order is also the visible (RGA) order — that
+        // holds for single-replica notes and notes only ever edited by us. Once two
+        // replicas have non-zero counters, log positions can diverge from visible
+        // positions and "penultimate's end" can be wrong. Refuse rather than corrupt.
+        val replicasWithEdits = countReplicasWithEdits(replicaList, ourReplicaUuid)
+        require(replicasWithEdits <= 1) {
+            "Note has $replicasWithEdits other replicas with edits — multi-replica " +
+                "append needs proper RGA traversal which isn't implemented yet. " +
+                "Refusing to write to avoid CRDT corruption."
         }
-        // Append N new entries (one per char).
-        repeat(n) { i ->
-            noteFields.add(buildAttributeRun(length = 1, fontUuid = fontUuid, ts = nowEpochSec + i))
+        // Inspect the sentinel before trusting it as "always last": log its shape so
+        // anomalies are visible. (We don't fail closed yet — we don't have a verified
+        // canonical sentinel encoding to compare against.)
+        logOp("sentinel(last)", opEntries.last().value)
+        if (opEntries.size >= 2) {
+            logOp("penultimate", opEntries[opEntries.size - 2].value)
         }
-        Log.i(TAG, "rewrite step 5: dropped ${existingAttrRunIndices.size} attribute_run, appended $n")
-
-        // 6. Re-encode bottom-up.
-        docFields[noteIdx] = docFields[noteIdx].copy(payload = ProtobufWire.encode(noteFields))
-        top[docFieldIdx] = top[docFieldIdx].copy(payload = ProtobufWire.encode(docFields))
-        return ProtobufWire.encode(top)
-    }
-
-    /**
-     * Build a CRDT op shaped like the ones we observed:
-     *   { field 1 = {field 1 = replicaIdx, field 2 = fromOffset},
-     *     field 2 = length,
-     *     field 3 = {field 1 = replicaIdx, field 2 = 0},
-     *     field 5 = seq }
-     */
-    private fun buildRunOp(replicaIdx: Int, fromOffset: Long, length: Long, seq: Long): ProtobufWire.Field {
-        val from = listOf(
-            ProtobufWire.encodeVarintField(1, replicaIdx.toLong()),
-            ProtobufWire.encodeVarintField(2, fromOffset),
+        Log.i(
+            TAG,
+            "topo: ourReplica=$ourReplicaIndex ourCounter=$ourCounter " +
+                "anchor=($anchorReplica,$anchorClock) maxSeq=$maxSeq append.n=$n " +
+                "replicasWithEdits=$replicasWithEdits",
         )
-        val to = listOf(
-            ProtobufWire.encodeVarintField(1, replicaIdx.toLong()),
-            ProtobufWire.encodeVarintField(2, 0L),
+
+        // ----- Step 3: build the new run op (NEW op, not a bump of an existing one) -----
+        val fromCharId = listOf(
+            ProtobufWire.encodeVarintField(FIELD_CHARID_REPLICA, ourReplicaIndex.toLong()),
+            ProtobufWire.encodeVarintField(FIELD_CHARID_CLOCK, ourCounter),
+        )
+        val toCharId = listOf(
+            ProtobufWire.encodeVarintField(FIELD_CHARID_REPLICA, anchorReplica),
+            ProtobufWire.encodeVarintField(FIELD_CHARID_CLOCK, anchorClock),
         )
         val opFields = listOf(
-            ProtobufWire.Field(1, ProtobufWire.WIRE_LENGTH_DELIM, ProtobufWire.encode(from)),
-            ProtobufWire.encodeVarintField(2, length),
-            ProtobufWire.Field(3, ProtobufWire.WIRE_LENGTH_DELIM, ProtobufWire.encode(to)),
-            ProtobufWire.encodeVarintField(5, seq),
+            ProtobufWire.Field(FIELD_OP_FROM, ProtobufWire.WIRE_LENGTH_DELIM, ProtobufWire.encode(fromCharId)),
+            ProtobufWire.encodeVarintField(FIELD_OP_COUNT, n.toLong()),
+            ProtobufWire.Field(FIELD_OP_TO, ProtobufWire.WIRE_LENGTH_DELIM, ProtobufWire.encode(toCharId)),
+            ProtobufWire.encodeVarintField(FIELD_OP_SEQ, maxSeq + 1),
         )
-        return ProtobufWire.Field(
+        val newOp = ProtobufWire.Field(
             FIELD_NOTE_OPS,
             ProtobufWire.WIRE_LENGTH_DELIM,
             ProtobufWire.encode(opFields),
         )
+
+        // ----- Step 4: bump OUR replica's counter by n -----
+        // CRITICAL: do this BEFORE inserting the new op, so we can address the
+        // replicas field by its still-valid `replicasIdx`. Inserting the new op
+        // shifts every noteFields index >= sentinelIdx by +1; the replicas field
+        // (Note.field 4) sits AFTER the ops (Note.field 3) in canonical proto
+        // ordering, so its index would shift. Mutate it first, op-insert last.
+        val ourEntry = replicaList[ourEntryListIdx]
+        val es = ProtobufWire.decode(ourEntry.payload).toMutableList()
+        val cbIdx = es.indexOfFirst {
+            it.fieldNumber == FIELD_REPLICA_ENTRY_COUNTER_BLOCK && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        val newCounter = ourCounter + n
+        if (cbIdx >= 0) {
+            val cs = ProtobufWire.decode(es[cbIdx].payload).toMutableList()
+            val cvIdx = cs.indexOfFirst {
+                it.fieldNumber == FIELD_COUNTER_BLOCK_VALUE && it.wireType == ProtobufWire.WIRE_VARINT
+            }
+            if (cvIdx >= 0) {
+                cs[cvIdx] = ProtobufWire.encodeVarintField(FIELD_COUNTER_BLOCK_VALUE, newCounter)
+            } else {
+                cs.add(0, ProtobufWire.encodeVarintField(FIELD_COUNTER_BLOCK_VALUE, newCounter))
+            }
+            es[cbIdx] = es[cbIdx].copy(payload = ProtobufWire.encode(cs))
+        } else {
+            val cb = listOf(ProtobufWire.encodeVarintField(FIELD_COUNTER_BLOCK_VALUE, newCounter))
+            es.add(
+                ProtobufWire.Field(
+                    FIELD_REPLICA_ENTRY_COUNTER_BLOCK,
+                    ProtobufWire.WIRE_LENGTH_DELIM,
+                    ProtobufWire.encode(cb),
+                ),
+            )
+        }
+        replicaList[ourEntryListIdx] = ourEntry.copy(payload = ProtobufWire.encode(es))
+        noteFields[replicasIdx] = noteFields[replicasIdx].copy(payload = ProtobufWire.encode(replicaList))
+
+        // ----- Step 5: append to note_text (UTF-8 bytes) -----
+        // Modifies noteFields[noteTextIdx] in place at field 2, which is BEFORE
+        // both ops (field 3) and replicas (field 4) so its index never shifts.
+        val noteTextIdx = noteFields.indexOfFirst {
+            it.fieldNumber == FIELD_NOTE_TEXT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        require(noteTextIdx >= 0) { "Missing Note.note_text" }
+        val oldText = noteFields[noteTextIdx].payload
+        noteFields[noteTextIdx] = noteFields[noteTextIdx].copy(payload = oldText + newBytes)
+
+        // ----- Step 6: insert the new op before the sentinel -----
+        // (Doing this LAST among the index-shifting mutations means later code
+        // doesn't need to recompute replicasIdx / noteTextIdx.)
+        val sentinelNoteFieldIdx = opEntries.last().index
+        noteFields.add(sentinelNoteFieldIdx, newOp)
+
+        // ----- Step 7: append n attribute_run entries (one per code unit) -----
+        // Adds at the END of noteFields, doesn't shift any earlier index.
+        val fontUuid = findFontUuid(noteFields) ?: ByteArray(16)
+        repeat(n) { i ->
+            noteFields.add(buildAttributeRun(length = 1, fontUuid = fontUuid, ts = nowEpochSec + i))
+        }
+
+        // ----- Step 8: re-encode bottom-up -----
+        docFields[noteIdx] = docFields[noteIdx].copy(payload = ProtobufWire.encode(noteFields))
+        top[docIdx] = top[docIdx].copy(payload = ProtobufWire.encode(docFields))
+        return ProtobufWire.encode(top)
+    }
+
+    /**
+     * Number of replicas other than us that have a non-zero counter — i.e. that
+     * have actually authored characters. Used to gate the multi-replica safety
+     * check: 0 means a fresh note, 1 means another device created it (and we're
+     * about to be the second replica), >1 means concurrent multi-device editing
+     * which the current append-anchor heuristic can't handle.
+     */
+    private fun countReplicasWithEdits(
+        replicaList: List<ProtobufWire.Field>,
+        ourUuid: ByteArray,
+    ): Int {
+        var count = 0
+        for (f in replicaList) {
+            if (f.fieldNumber != FIELD_REPLICAS_LIST_ENTRY ||
+                f.wireType != ProtobufWire.WIRE_LENGTH_DELIM
+            ) continue
+            val es = ProtobufWire.decode(f.payload)
+            val uuidField = es.firstOrNull {
+                it.fieldNumber == FIELD_REPLICA_ENTRY_UUID &&
+                    it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }
+            if (uuidField?.payload?.contentEquals(ourUuid) == true) continue
+            val counter = es.firstOrNull {
+                it.fieldNumber == FIELD_REPLICA_ENTRY_COUNTER_BLOCK &&
+                    it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }?.let {
+                ProtobufWire.decode(it.payload).firstOrNull { fld ->
+                    fld.fieldNumber == FIELD_COUNTER_BLOCK_VALUE &&
+                        fld.wireType == ProtobufWire.WIRE_VARINT
+                }?.let { ProtobufWire.decodeVarint(it) }
+            } ?: 0L
+            if (counter > 0) count++
+        }
+        return count
+    }
+
+    private fun logOp(label: String, op: ProtobufWire.Field) {
+        val sub = ProtobufWire.decode(op.payload)
+        val from = sub.firstOrNull {
+            it.fieldNumber == FIELD_OP_FROM && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }?.let { ProtobufWire.decode(it.payload) }
+        val fromRid = from?.firstOrNull {
+            it.fieldNumber == FIELD_CHARID_REPLICA && it.wireType == ProtobufWire.WIRE_VARINT
+        }?.let { ProtobufWire.decodeVarint(it) }
+        val fromOff = from?.firstOrNull {
+            it.fieldNumber == FIELD_CHARID_CLOCK && it.wireType == ProtobufWire.WIRE_VARINT
+        }?.let { ProtobufWire.decodeVarint(it) }
+        val count = sub.firstOrNull {
+            it.fieldNumber == FIELD_OP_COUNT && it.wireType == ProtobufWire.WIRE_VARINT
+        }?.let { ProtobufWire.decodeVarint(it) }
+        val to = sub.firstOrNull {
+            it.fieldNumber == FIELD_OP_TO && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }?.let { ProtobufWire.decode(it.payload) }
+        val toRid = to?.firstOrNull {
+            it.fieldNumber == FIELD_CHARID_REPLICA && it.wireType == ProtobufWire.WIRE_VARINT
+        }?.let { ProtobufWire.decodeVarint(it) }
+        val toOff = to?.firstOrNull {
+            it.fieldNumber == FIELD_CHARID_CLOCK && it.wireType == ProtobufWire.WIRE_VARINT
+        }?.let { ProtobufWire.decodeVarint(it) }
+        val seq = sub.firstOrNull {
+            it.fieldNumber == FIELD_OP_SEQ && it.wireType == ProtobufWire.WIRE_VARINT
+        }?.let { ProtobufWire.decodeVarint(it) }
+        val unknownFields = sub.filter {
+            it.fieldNumber !in setOf(FIELD_OP_FROM, FIELD_OP_COUNT, FIELD_OP_TO, FIELD_OP_SEQ)
+        }.map { "f${it.fieldNumber}/w${it.wireType}/${it.payload.size}b" }
+        Log.i(
+            TAG,
+            "$label op: from=($fromRid,$fromOff) count=$count to=($toRid,$toOff) seq=$seq " +
+                "extra=$unknownFields",
+        )
+    }
+
+    private data class ReplicaScan(
+        /** Position in `replicaList` (the wrapper's internal slot) of OUR entry, or -1. */
+        val ourListIdx: Int,
+        /** 1-based replica index (entry position) of OUR entry, or -1 if not found. */
+        val ourIndex1Based: Int,
+        /** Current counter[0] value for OUR entry, or 0 if not found. */
+        val ourCounter: Long,
+        /** Total number of replica entries in the registry. */
+        val totalEntries: Int,
+    )
+
+    /**
+     * Scan `Note.replicas` once: log every entry's UUID and counter, detect
+     * duplicate-UUID corruption (refuses if found), and locate OUR entry by
+     * UUID. Returns a snapshot we can act on.
+     */
+    private fun scanReplicas(
+        replicaList: List<ProtobufWire.Field>,
+        ourUuid: ByteArray,
+    ): ReplicaScan {
+        var ourListIdx = -1
+        var ourIndex = -1
+        var ourCounter = 0L
+        var entriesSeen = 0
+        val sb = StringBuilder()
+        val seenUuids = HashMap<String, Int>()
+        for ((listIdx, f) in replicaList.withIndex()) {
+            if (f.fieldNumber != FIELD_REPLICAS_LIST_ENTRY ||
+                f.wireType != ProtobufWire.WIRE_LENGTH_DELIM
+            ) continue
+            entriesSeen++
+            val es = ProtobufWire.decode(f.payload)
+            val uuidField = es.firstOrNull {
+                it.fieldNumber == FIELD_REPLICA_ENTRY_UUID &&
+                    it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }
+            val uuidBytes = uuidField?.payload
+            val uuidHex = uuidBytes?.let { hex(it) } ?: "<no-uuid>"
+            val cb = es.firstOrNull {
+                it.fieldNumber == FIELD_REPLICA_ENTRY_COUNTER_BLOCK &&
+                    it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }
+            val counter = cb?.let {
+                ProtobufWire.decode(it.payload).firstOrNull { fld ->
+                    fld.fieldNumber == FIELD_COUNTER_BLOCK_VALUE &&
+                        fld.wireType == ProtobufWire.WIRE_VARINT
+                }?.let { ProtobufWire.decodeVarint(it) }
+            } ?: 0L
+            val isUs = uuidBytes?.contentEquals(ourUuid) == true
+            sb.append("  #").append(entriesSeen).append(" uuid=").append(uuidHex)
+                .append(" counter=").append(counter)
+            if (isUs) sb.append("  <-- US")
+            sb.append('\n')
+
+            seenUuids[uuidHex]?.let { prev ->
+                error(
+                    "Replica registry corruption: UUID $uuidHex appears at entries " +
+                        "$prev and $entriesSeen — refusing to write to avoid making it worse",
+                )
+            }
+            seenUuids[uuidHex] = entriesSeen
+
+            if (isUs) {
+                ourListIdx = listIdx
+                ourIndex = entriesSeen
+                ourCounter = counter
+            }
+        }
+        Log.i(
+            TAG,
+            "Replica scan: ${entriesSeen} existing entries, ourUuid=${hex(ourUuid)}\n$sb" +
+                "  decision=" + if (ourIndex < 0) "register-new" else "match-existing#$ourIndex",
+        )
+        return ReplicaScan(ourListIdx, ourIndex, ourCounter, entriesSeen)
+    }
+
+    private fun findFontUuid(noteFields: List<ProtobufWire.Field>): ByteArray? {
+        for (f in noteFields) {
+            if (f.fieldNumber != FIELD_NOTE_ATTRIBUTE_RUN || f.wireType != ProtobufWire.WIRE_LENGTH_DELIM) continue
+            val subs = ProtobufWire.decode(f.payload)
+            val fontField = subs.firstOrNull {
+                it.fieldNumber == FIELD_ATTR_FONT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            } ?: continue
+            val fontSubs = ProtobufWire.decode(fontField.payload)
+            val uuidField = fontSubs.firstOrNull {
+                it.fieldNumber == FIELD_FONT_UUID && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }
+            if (uuidField != null && uuidField.payload.size == 16) return uuidField.payload
+        }
+        return null
     }
 
     private fun buildAttributeRun(length: Int, fontUuid: ByteArray, ts: Long): ProtobufWire.Field {
-        // Inner: { field 9 = <16-byte uuid> }
         val fontInner = listOf(
             ProtobufWire.Field(FIELD_FONT_UUID, ProtobufWire.WIRE_LENGTH_DELIM, fontUuid),
         )
-        // attribute_run: { field 1 = length, field 2 = font, field 13 = ts }
         val runFields = listOf(
             ProtobufWire.encodeVarintField(FIELD_ATTR_LENGTH, length.toLong()),
             ProtobufWire.Field(FIELD_ATTR_FONT, ProtobufWire.WIRE_LENGTH_DELIM, ProtobufWire.encode(fontInner)),
@@ -353,4 +496,7 @@ object NoteAppender {
             ProtobufWire.encode(runFields),
         )
     }
+
+    private fun hex(b: ByteArray): String =
+        b.joinToString("") { ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1) }
 }

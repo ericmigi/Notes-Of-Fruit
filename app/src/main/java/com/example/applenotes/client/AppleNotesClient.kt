@@ -4,6 +4,7 @@ import android.util.Log
 import com.example.applenotes.auth.ICloudSession
 import com.example.applenotes.auth.LENIENT_JSON
 import com.example.applenotes.auth.USER_AGENT
+import com.example.applenotes.proto.NoteBodyEditor
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.request.headers
@@ -117,12 +118,14 @@ class AppleNotesClient(
         rec.serverErrorCode?.let { code ->
             error("lookup per-record error: $code reason=${rec.reason ?: "?"}")
         }
-        return NoteRecord(
+        val record = NoteRecord(
             recordName = rec.recordName ?: recordName,
             recordType = rec.recordType,
             recordChangeTag = rec.recordChangeTag,
             rawFields = rec.fields ?: emptyMap(),
         )
+        logRecordSummary("lookupNote", record)
+        return record
     }
 
     /**
@@ -165,12 +168,14 @@ class AppleNotesClient(
         rec.serverErrorCode?.let { code ->
             error("modifyFields per-record error: $code reason=${rec.reason ?: "?"}")
         }
-        return NoteRecord(
+        val record = NoteRecord(
             recordName = rec.recordName ?: recordName,
             recordType = rec.recordType,
             recordChangeTag = rec.recordChangeTag,
             rawFields = rec.fields ?: emptyMap(),
         )
+        Log.i(TAG, "modifyFields returned tag=${record.recordChangeTag} fieldKeys=${record.rawFields.keys}")
+        return record
     }
 
     /** Soft-delete a note by setting Deleted=1 on its record. */
@@ -208,6 +213,7 @@ class AppleNotesClient(
             }
         }
         Log.i(TAG, "modifyNoteBody: $recordName tag=$recordChangeTag b64.len=${newTextDataEncryptedB64.length}")
+        Log.i(TAG, "modifyNoteBody SENT proto: ${NoteBodyEditor.summarizeBase64(newTextDataEncryptedB64)}")
         val (status, raw) = postJson("/records/modify", payload)
         Log.i(TAG, "modifyNoteBody response: HTTP $status, body[0..400]=${raw.take(400)}")
         if (status !in 200..299) error("CloudKit records/modify HTTP $status: ${raw.take(800)}")
@@ -216,12 +222,43 @@ class AppleNotesClient(
         rec.serverErrorCode?.let { code ->
             error("modifyNoteBody per-record error: $code reason=${rec.reason ?: "?"}")
         }
-        return NoteRecord(
+        val record = NoteRecord(
             recordName = rec.recordName ?: recordName,
             recordType = rec.recordType,
             recordChangeTag = rec.recordChangeTag,
             rawFields = rec.fields ?: emptyMap(),
         )
+        Log.i(TAG, "modifyNoteBody returned tag=${record.recordChangeTag} fieldKeys=${record.rawFields.keys}")
+        logRecordSummary("modifyNoteBody", record, sentB64 = newTextDataEncryptedB64)
+
+        // Verify-after-save: re-fetch the canonical server state. The /modify response
+        // doesn't always echo TextDataEncrypted, so this is the only way to see what
+        // iCloud actually persisted (and what the next /lookup or another device would see).
+        val verified = runCatching { lookupNote(recordName) }.getOrElse {
+            Log.w(TAG, "verify-after-save lookup failed", it)
+            return record
+        }
+        val verifiedB64 = verified.stringField("TextDataEncrypted")
+        if (verifiedB64 != null) {
+            val matchesSent = verifiedB64 == newTextDataEncryptedB64
+            Log.i(TAG, "verify-after-save: tag=${verified.recordChangeTag} text.b64.len=${verifiedB64.length} matchesSent=$matchesSent")
+        }
+        return verified
+    }
+
+    private fun logRecordSummary(label: String, record: NoteRecord, sentB64: String? = null) {
+        val textB64 = record.stringField("TextDataEncrypted")
+        if (textB64 != null) {
+            val tag = if (sentB64 != null) " matchesSent=${textB64 == sentB64}" else ""
+            Log.i(TAG, "$label TextDataEncrypted.b64.len=${textB64.length}$tag")
+            Log.i(TAG, "$label TextDataEncrypted proto: ${NoteBodyEditor.summarizeBase64(textB64)}")
+        } else {
+            Log.i(TAG, "$label has no TextDataEncrypted in returned fields (keys=${record.rawFields.keys})")
+        }
+        val replicaRegistryB64 = record.stringField("ReplicaIDToNotesVersionDataEncrypted")
+        if (replicaRegistryB64 != null) {
+            Log.i(TAG, "$label ReplicaIDToNotesVersionDataEncrypted.b64.len=${replicaRegistryB64.length} prefix='${replicaRegistryB64.take(80)}'")
+        }
     }
 
     private suspend fun postJson(relPath: String, payload: JsonObject): Pair<Int, String> {
