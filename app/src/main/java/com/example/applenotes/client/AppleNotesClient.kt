@@ -87,10 +87,17 @@ class AppleNotesClient(
                     .forEach { add(JsonPrimitive(it)) }
             }
         }
+        Log.i(TAG, "fetchRecents: requesting up to $limit notes")
+        val t0 = System.currentTimeMillis()
         val (status, raw) = postJson("/records/query", payload)
-        if (status !in 200..299) error("CloudKit records/query HTTP $status: ${raw.take(800)}")
+        val elapsed = System.currentTimeMillis() - t0
+        Log.i(TAG, "fetchRecents response: HTTP $status, ${raw.length}B in ${elapsed}ms")
+        if (status !in 200..299) {
+            Log.e(TAG, "fetchRecents FAILED body=${raw.take(800)}")
+            error("CloudKit records/query HTTP $status: ${raw.take(800)}")
+        }
         val parsed = LENIENT_JSON.decodeFromString(QueryResponse.serializer(), raw)
-        return (parsed.records ?: emptyList()).map { rec ->
+        val results = (parsed.records ?: emptyList()).map { rec ->
             NoteSummary(
                 recordName = rec.recordName ?: "",
                 title = rec.fields?.get("TitleEncrypted")?.let(::decodeEncryptedString),
@@ -100,8 +107,19 @@ class AppleNotesClient(
                 deleted = rec.fields?.get("Deleted")?.let(::extractStringValue) == "1",
             )
         }
+        Log.i(TAG, "fetchRecents: returning ${results.size} records (continuationMarker=${parsed.continuationMarker != null})")
+        for ((i, n) in results.withIndex()) {
+            Log.i(
+                TAG,
+                "  [$i] ${n.recordName} title='${n.title?.take(40)}' " +
+                    "snippet='${n.snippet?.take(40)}' " +
+                    "mod=${n.modificationTimestampMs} deleted=${n.deleted}",
+            )
+        }
+        return results
     }
 
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
     suspend fun lookupNote(recordName: String): NoteRecord {
         val payload: JsonObject = buildJsonObject {
             put("zoneID", buildJsonObject { put("zoneName", "Notes") })
@@ -110,12 +128,19 @@ class AppleNotesClient(
             }
         }
         Log.i(TAG, "lookupNote: $recordName")
+        val t0 = System.currentTimeMillis()
         val (status, raw) = postJson("/records/lookup", payload)
-        if (status !in 200..299) error("CloudKit records/lookup HTTP $status: ${raw.take(800)}")
+        val elapsed = System.currentTimeMillis() - t0
+        Log.i(TAG, "lookupNote response: HTTP $status, ${raw.length}B in ${elapsed}ms")
+        if (status !in 200..299) {
+            Log.e(TAG, "lookupNote FAILED body=${raw.take(800)}")
+            error("CloudKit records/lookup HTTP $status: ${raw.take(800)}")
+        }
         val parsed = LENIENT_JSON.decodeFromString(QueryResponse.serializer(), raw)
         val rec = parsed.records?.firstOrNull()
             ?: error("records/lookup returned no record for $recordName")
         rec.serverErrorCode?.let { code ->
+            Log.e(TAG, "lookupNote per-record error: $code reason=${rec.reason}")
             error("lookup per-record error: $code reason=${rec.reason ?: "?"}")
         }
         val record = NoteRecord(
@@ -124,6 +149,18 @@ class AppleNotesClient(
             recordChangeTag = rec.recordChangeTag,
             rawFields = rec.fields ?: emptyMap(),
         )
+        Log.i(TAG, "lookupNote: tag=${record.recordChangeTag} fields=${record.rawFields.keys}")
+        record.stringField("TitleEncrypted")?.let {
+            val decoded = runCatching { kotlin.io.encoding.Base64.decode(it).decodeToString() }.getOrNull()
+            Log.i(TAG, "lookupNote TitleEncrypted decoded='${decoded?.take(60)}'")
+        }
+        record.stringField("SnippetEncrypted")?.let {
+            val decoded = runCatching { kotlin.io.encoding.Base64.decode(it).decodeToString() }.getOrNull()
+            Log.i(TAG, "lookupNote SnippetEncrypted decoded='${decoded?.take(60)}'")
+        }
+        record.stringField("ModificationDate")?.let {
+            Log.i(TAG, "lookupNote ModificationDate=$it")
+        }
         logRecordSummary("lookupNote", record)
         return record
     }
@@ -187,11 +224,21 @@ class AppleNotesClient(
         )
     }
 
-    /** Replace TextDataEncrypted on a Note record. */
+    /**
+     * Replace TextDataEncrypted on a Note record, AND optionally update the
+     * sibling TitleEncrypted / SnippetEncrypted fields. Apple's clients seem
+     * to use Title and Snippet as the "did this note visibly change?" signal —
+     * iCloud.com sets them whenever it edits. Skipping them is what kept Mac
+     * from refreshing earlier (and the Android list view from updating, since
+     * fetchRecents reads only Title/Snippet).
+     */
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
     suspend fun modifyNoteBody(
         recordName: String,
         recordChangeTag: String,
         newTextDataEncryptedB64: String,
+        newTitle: String? = null,
+        newSnippet: String? = null,
     ): NoteRecord {
         val payload: JsonObject = buildJsonObject {
             put("zoneID", buildJsonObject { put("zoneName", "Notes") })
@@ -207,19 +254,43 @@ class AppleNotesClient(
                                 put("type", "ENCRYPTED_BYTES")
                                 put("value", newTextDataEncryptedB64)
                             })
+                            if (newTitle != null) {
+                                put("TitleEncrypted", buildJsonObject {
+                                    put("type", "ENCRYPTED_STRING")
+                                    put("value", kotlin.io.encoding.Base64.encode(newTitle.encodeToByteArray()))
+                                })
+                            }
+                            if (newSnippet != null) {
+                                put("SnippetEncrypted", buildJsonObject {
+                                    put("type", "ENCRYPTED_STRING")
+                                    put("value", kotlin.io.encoding.Base64.encode(newSnippet.encodeToByteArray()))
+                                })
+                            }
                         })
                     })
                 })
             }
         }
-        Log.i(TAG, "modifyNoteBody: $recordName tag=$recordChangeTag b64.len=${newTextDataEncryptedB64.length}")
+        Log.i(
+            TAG,
+            "modifyNoteBody: rec=$recordName tag=$recordChangeTag b64.len=${newTextDataEncryptedB64.length} " +
+                "title=${newTitle?.let { "'${it.take(40)}'" } ?: "<unchanged>"} " +
+                "snippet=${newSnippet?.let { "'${it.take(40)}'" } ?: "<unchanged>"}",
+        )
         Log.i(TAG, "modifyNoteBody SENT proto: ${NoteBodyEditor.summarizeBase64(newTextDataEncryptedB64)}")
+        val t0 = System.currentTimeMillis()
         val (status, raw) = postJson("/records/modify", payload)
-        Log.i(TAG, "modifyNoteBody response: HTTP $status, body[0..400]=${raw.take(400)}")
-        if (status !in 200..299) error("CloudKit records/modify HTTP $status: ${raw.take(800)}")
+        val elapsed = System.currentTimeMillis() - t0
+        Log.i(TAG, "modifyNoteBody response: HTTP $status, ${raw.length}B in ${elapsed}ms")
+        Log.i(TAG, "modifyNoteBody response body[0..600]=${raw.take(600)}")
+        if (status !in 200..299) {
+            Log.e(TAG, "modifyNoteBody FAILED body=${raw.take(800)}")
+            error("CloudKit records/modify HTTP $status: ${raw.take(800)}")
+        }
         val parsed = LENIENT_JSON.decodeFromString(QueryResponse.serializer(), raw)
         val rec = parsed.records?.firstOrNull() ?: error("records/modify returned no record")
         rec.serverErrorCode?.let { code ->
+            Log.e(TAG, "modifyNoteBody per-record error: $code reason=${rec.reason}")
             error("modifyNoteBody per-record error: $code reason=${rec.reason ?: "?"}")
         }
         val record = NoteRecord(
@@ -229,11 +300,18 @@ class AppleNotesClient(
             rawFields = rec.fields ?: emptyMap(),
         )
         Log.i(TAG, "modifyNoteBody returned tag=${record.recordChangeTag} fieldKeys=${record.rawFields.keys}")
+        // Decoded values for the human-readable fields if echoed.
+        record.stringField("TitleEncrypted")?.let {
+            val decoded = runCatching { kotlin.io.encoding.Base64.decode(it).decodeToString() }.getOrNull()
+            Log.i(TAG, "modifyNoteBody returned TitleEncrypted.b64='${it.take(60)}' decoded='${decoded?.take(40)}'")
+        }
+        record.stringField("SnippetEncrypted")?.let {
+            val decoded = runCatching { kotlin.io.encoding.Base64.decode(it).decodeToString() }.getOrNull()
+            Log.i(TAG, "modifyNoteBody returned SnippetEncrypted.b64='${it.take(60)}' decoded='${decoded?.take(40)}'")
+        }
         logRecordSummary("modifyNoteBody", record, sentB64 = newTextDataEncryptedB64)
 
-        // Verify-after-save: re-fetch the canonical server state. The /modify response
-        // doesn't always echo TextDataEncrypted, so this is the only way to see what
-        // iCloud actually persisted (and what the next /lookup or another device would see).
+        // Verify-after-save: re-fetch and compare.
         val verified = runCatching { lookupNote(recordName) }.getOrElse {
             Log.w(TAG, "verify-after-save lookup failed", it)
             return record

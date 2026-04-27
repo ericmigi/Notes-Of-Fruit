@@ -241,8 +241,24 @@ fun AppleNotesApp() {
                         val appended = newBody.removePrefix(originalBody)
                         require(appended.isNotEmpty()) { "Pure-append marked but no new chars" }
                         val newB64 = NoteAppender.appendBase64(textB64, uuid, appended, now)
-                        val updated = AppleNotesClient(httpClient, s.session)
-                            .modifyNoteBody(s.record.recordName, tag, newB64)
+                        // Compute new title and snippet from the post-append body so
+                        // Apple's Title/Snippet CloudKit fields stay in sync. Apple's
+                        // clients (Mac, iCloud.com list view, our own list view) use
+                        // these fields for "did this note visibly change?".
+                        val (newTitle, newSnippet) = computeTitleAndSnippet(newBody)
+                        val (oldTitle, oldSnippet) = computeTitleAndSnippet(originalBody)
+                        Log.i(
+                            TAG,
+                            "save: title '${oldTitle.take(30)}'->'${newTitle.take(30)}' " +
+                                "snippet '${oldSnippet.take(30)}'->'${newSnippet.take(30)}'",
+                        )
+                        val updated = AppleNotesClient(httpClient, s.session).modifyNoteBody(
+                            s.record.recordName,
+                            tag,
+                            newB64,
+                            newTitle = newTitle.takeIf { it != oldTitle },
+                            newSnippet = newSnippet.takeIf { it != oldSnippet },
+                        )
                         state = ScreenState.Detail(s.session, updated)
                     } catch (e: Throwable) {
                         Log.e(TAG, "save failed", e)
@@ -440,6 +456,23 @@ private fun humanRelative(epochMs: Long): String {
 }
 
 private fun Modifier.clickableRow(onClick: () -> Unit): Modifier = clickable(onClick = onClick)
+
+/**
+ * Apple Notes derives Title and Snippet from the body's first non-empty line
+ * (= title) and what follows (= snippet preview). The CloudKit `TitleEncrypted`
+ * and `SnippetEncrypted` fields are server-cached copies of these — Apple's
+ * clients (Mac, iCloud.com list view) treat them as the canonical visible
+ * preview. Updating them along with TextDataEncrypted on every edit keeps
+ * lists fresh and gives Mac a clean signal that the note actually changed.
+ */
+internal fun computeTitleAndSnippet(body: String): Pair<String, String> {
+    val lines = body.split("\n")
+    val title = lines.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
+    val titleIdx = lines.indexOfFirst { it.isNotBlank() }
+    val rest = if (titleIdx >= 0) lines.drop(titleIdx + 1) else emptyList()
+    val snippet = rest.firstOrNull { it.isNotBlank() }?.trim()?.take(120).orEmpty()
+    return title to snippet
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
