@@ -225,6 +225,75 @@ class AppleNotesClient(
     }
 
     /**
+     * Create a brand-new Note record with the given title + body. We need a
+     * Folder reference (CKReference) to attach it under — easiest is to copy
+     * one from any existing note. The TextDataEncrypted body is a bare
+     * topotext.String registering us as the sole replica with one substring
+     * covering the entire content.
+     */
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+    suspend fun createNote(
+        title: String,
+        body: String,
+        folderRef: JsonElement,
+        ourReplicaUuid: ByteArray,
+    ): NoteRecord {
+        val recordName = java.util.UUID.randomUUID().toString().uppercase()
+        // Combine title and body into a single note_text where line 1 = title.
+        val noteText = if (title.isNotEmpty() && body.isNotEmpty()) "$title\n$body"
+            else if (title.isNotEmpty()) title
+            else body
+        val textDataB64 = com.example.applenotes.proto.NoteCreator.buildEmptyNoteB64(
+            ourReplicaUuid, noteText,
+        )
+        val payload: JsonObject = buildJsonObject {
+            put("zoneID", buildJsonObject { put("zoneName", "Notes") })
+            putJsonArray("operations") {
+                add(buildJsonObject {
+                    put("operationType", "create")
+                    put("record", buildJsonObject {
+                        put("recordName", recordName)
+                        put("recordType", "Note")
+                        put("fields", buildJsonObject {
+                            put("TextDataEncrypted", buildJsonObject {
+                                put("type", "ENCRYPTED_BYTES")
+                                put("value", textDataB64)
+                            })
+                            put("TitleEncrypted", buildJsonObject {
+                                put("type", "ENCRYPTED_STRING")
+                                put("value", kotlin.io.encoding.Base64.encode(title.encodeToByteArray()))
+                            })
+                            put("SnippetEncrypted", buildJsonObject {
+                                put("type", "ENCRYPTED_STRING")
+                                put("value", kotlin.io.encoding.Base64.encode(body.take(120).encodeToByteArray()))
+                            })
+                            // Reuse Folder reference structure verbatim from the sample note.
+                            put("Folder", folderRef)
+                        })
+                    })
+                })
+            }
+        }
+        Log.i(TAG, "createNote: $recordName title='${title.take(40)}' body.len=${body.length}")
+        val (status, raw) = postJson("/records/modify", payload)
+        Log.i(TAG, "createNote response: HTTP $status, ${raw.length}B body[0..400]=${raw.take(400)}")
+        if (status !in 200..299) error("CloudKit createNote HTTP $status: ${raw.take(800)}")
+        val parsed = LENIENT_JSON.decodeFromString(QueryResponse.serializer(), raw)
+        val rec = parsed.records?.firstOrNull() ?: error("createNote returned no record")
+        rec.serverErrorCode?.let { code ->
+            error("createNote per-record error: $code reason=${rec.reason ?: "?"}")
+        }
+        val record = NoteRecord(
+            recordName = rec.recordName ?: recordName,
+            recordType = rec.recordType,
+            recordChangeTag = rec.recordChangeTag,
+            rawFields = rec.fields ?: emptyMap(),
+        )
+        Log.i(TAG, "createNote returned tag=${record.recordChangeTag} fields=${record.rawFields.keys}")
+        return record
+    }
+
+    /**
      * Replace TextDataEncrypted on a Note record, AND optionally update the
      * sibling TitleEncrypted / SnippetEncrypted fields. Apple's clients seem
      * to use Title and Snippet as the "did this note visibly change?" signal —

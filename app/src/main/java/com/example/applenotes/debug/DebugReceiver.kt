@@ -117,6 +117,40 @@ class DebugReceiver : BroadcastReceiver() {
                     }
                 }
             }
+            ACTION_DELETE_BY_TITLE -> {
+                val title = intent.getStringExtra("title")
+                if (title == null) {
+                    Log.e(TAG, "DELETE_BY_TITLE missing title")
+                    return
+                }
+                launchOp("DELETE_BY_TITLE") { client, _ ->
+                    val match = findByTitle(client, title)
+                    if (match == null) {
+                        Log.w(TAG, "DELETE_BY_TITLE_NOT_FOUND title='$title'")
+                    } else {
+                        Log.i(TAG, "DELETE_BY_TITLE_FOUND '$title' -> ${match.recordName}")
+                        val record = client.lookupNote(match.recordName)
+                        val tag = record.recordChangeTag ?: error("no tag")
+                        client.deleteNote(match.recordName, tag)
+                        Log.i(TAG, "DELETE_BY_TITLE_OK ${match.recordName}")
+                    }
+                }
+            }
+            ACTION_CREATE -> {
+                val title = intent.getStringExtra("title") ?: ""
+                val body = intent.getStringExtra("body") ?: ""
+                launchOp("CREATE") { client, _ ->
+                    val uuid = DeviceIdentity.getOrCreate(context)
+                    // Find a folder reference from any existing note.
+                    val anyNote = client.fetchRecents(1).firstOrNull()
+                        ?: error("no existing notes to copy folder reference from")
+                    val sample = client.lookupNote(anyNote.recordName)
+                    val folderRef = sample.rawFields["Folder"]
+                        ?: error("sample note has no Folder field")
+                    val created = client.createNote(title, body, folderRef, uuid)
+                    Log.i(TAG, "CREATE_OK ${created.recordName}")
+                }
+            }
             else -> Log.w(TAG, "RECV unknown action=$action")
         }
     }
@@ -180,6 +214,8 @@ class DebugReceiver : BroadcastReceiver() {
         private const val ACTION_LOOKUP_BY_TITLE = "com.example.applenotes.LOOKUP_BY_TITLE"
         private const val ACTION_APPEND = "com.example.applenotes.APPEND"
         private const val ACTION_APPEND_BY_TITLE = "com.example.applenotes.APPEND_BY_TITLE"
+        private const val ACTION_DELETE_BY_TITLE = "com.example.applenotes.DELETE_BY_TITLE"
+        private const val ACTION_CREATE = "com.example.applenotes.CREATE"
 
         private val httpClient by lazy {
             HttpClient(OkHttp) { expectSuccess = false }
