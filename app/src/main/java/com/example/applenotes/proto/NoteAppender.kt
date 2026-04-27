@@ -115,6 +115,28 @@ object NoteAppender {
     private const val SENTINEL_REPLICA_ID = 0L
     private const val SENTINEL_CLOCK = 0xFFFFFFFFL
 
+    /**
+     * Strategy controlling how we structure the write. Different patterns to
+     * empirically figure out what Mac's CRDT replay accepts.
+     */
+    enum class Strategy {
+        /** Add a new Substring after the tail, like iCloud.com appears to do. */
+        APPEND,
+
+        /**
+         * Tombstone the existing live substring(s), add ONE new substring
+         * containing the FULL post-edit body. Mirrors Mac's own set-body
+         * pattern (see ref-152233 trace).
+         */
+        REWRITE_TOMBSTONE,
+    }
+
+    /** Process-wide strategy; override before tests via [setStrategy]. */
+    @Volatile
+    private var strategy: Strategy = Strategy.APPEND
+
+    fun setStrategy(s: Strategy) { strategy = s }
+
     fun appendBase64(
         textDataEncryptedB64: String,
         ourReplicaUuid: ByteArray,
@@ -128,9 +150,12 @@ object NoteAppender {
         val compressed = Base64.decode(textDataEncryptedB64)
         val format = Gzip.detect(compressed)
         val proto = Gzip.decompress(compressed)
-        Log.i(TAG, "appendBase64 IN: textLen=${text.length} protoLen=${proto.size} format=$format")
+        Log.i(TAG, "appendBase64 IN: textLen=${text.length} protoLen=${proto.size} format=$format strategy=$strategy")
         Log.i(TAG, "appendBase64 IN  proto: ${NoteBodyEditor.summarize(proto)}")
-        val newProto = appendBytes(proto, ourReplicaUuid, text, nowEpochSec)
+        val newProto = when (strategy) {
+            Strategy.APPEND -> appendBytes(proto, ourReplicaUuid, text, nowEpochSec)
+            Strategy.REWRITE_TOMBSTONE -> rewriteWithTombstoneBytes(proto, ourReplicaUuid, text, nowEpochSec)
+        }
         Log.i(TAG, "appendBase64 OUT proto: ${NoteBodyEditor.summarize(newProto)}")
         // CRITICAL: round-trip in the SAME compression format we read. iCloud.com
         // uses zlib for short notes, gzip for older / longer ones. Mac probably
@@ -352,6 +377,29 @@ object NoteAppender {
                 newTimestampClock,
             )
         }
+        // Lamport advance for OTHER replicas. When our edit pushes the doc-wide
+        // CharID Lamport clock past where any existing replica's counter1 was
+        // sitting, those replicas should see their counter1 bumped (= "I've now
+        // observed up to this clock"). Mac may use a vector-clock validity
+        // check that requires ALL replicas' counter1 >= doc-Lamport.
+        for (clockEntry in clocks) {
+            if (clockEntry.uuid.contentEquals(ourReplicaUuid)) continue
+            if (clockEntry.replicaClocks.size < 2) continue
+            val theirCharIDClock = clockEntry.replicaClocks[0].clock
+            val theirTimestampClock = clockEntry.replicaClocks[1].clock
+            if (theirCharIDClock < newCharIDClock) {
+                Log.i(
+                    TAG,
+                    "advancing replica#${clockEntry.replicaID} counter1 " +
+                        "$theirCharIDClock -> $newCharIDClock (Lamport)",
+                )
+                vtFields[clockEntry.vtFieldIdx] = updateExistingClockInPlace(
+                    vtFields[clockEntry.vtFieldIdx],
+                    newCharIDClock,
+                    theirTimestampClock,
+                )
+            }
+        }
         stringFields[timestampNoteFieldIdx] =
             stringFields[timestampNoteFieldIdx].copy(payload = ProtobufWire.encode(vtFields))
 
@@ -376,11 +424,37 @@ object NoteAppender {
         // mutations. We don't reference them after this point.
         stringFields.add(sentinelNoteFieldIdx, ourSubstring)
 
-        // ----- Append a new AttributeRun of length n -----
-        // Inherit the LAST existing AttributeRun's font if present (so our chars
-        // render in a similar style); otherwise emit a minimal run.
-        val templateFont = lastAttributeRunFont(stringFields)
-        stringFields.add(buildAttributeRun(length = n, fontFields = templateFont))
+        // ----- Extend the LAST existing AttributeRun by n -----
+        // Apple's invariant (verified by reading back what iCloud.com produces):
+        // attribute_run count tends to stay STABLE on simple appends — the last
+        // run's `length` is bumped instead of a new run being added. Adding a
+        // new run is technically legal but introduces a style boundary at our
+        // insertion point that other clients' merge code may treat as
+        // "different style starts here", potentially blocking sync.
+        val lastAttrRunNoteFieldIdx = stringFields.indexOfLast {
+            it.fieldNumber == FIELD_STRING_ATTRIBUTE_RUN && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        if (lastAttrRunNoteFieldIdx >= 0) {
+            val runFields = ProtobufWire.decode(stringFields[lastAttrRunNoteFieldIdx].payload).toMutableList()
+            val lengthIdx = runFields.indexOfFirst {
+                it.fieldNumber == FIELD_ATTR_LENGTH && it.wireType == ProtobufWire.WIRE_VARINT
+            }
+            if (lengthIdx >= 0) {
+                val oldLength = ProtobufWire.decodeVarint(runFields[lengthIdx])
+                runFields[lengthIdx] = ProtobufWire.encodeVarintField(FIELD_ATTR_LENGTH, oldLength + n)
+                Log.i(TAG, "extended last attribute_run length: $oldLength -> ${oldLength + n}")
+            } else {
+                runFields.add(0, ProtobufWire.encodeVarintField(FIELD_ATTR_LENGTH, n.toLong()))
+                Log.i(TAG, "added attribute_run length=$n (no prior length field)")
+            }
+            stringFields[lastAttrRunNoteFieldIdx] =
+                stringFields[lastAttrRunNoteFieldIdx].copy(payload = ProtobufWire.encode(runFields))
+        } else {
+            // Empty doc: emit a fresh attribute_run.
+            val templateFont = lastAttributeRunFont(stringFields)
+            stringFields.add(buildAttributeRun(length = n, fontFields = templateFont))
+            Log.i(TAG, "no existing attribute_run; added new length=$n")
+        }
 
         // ----- Re-encode bottom-up -----
         versionFields[dataIdx] = versionFields[dataIdx].copy(payload = ProtobufWire.encode(stringFields))
@@ -389,6 +463,160 @@ object NoteAppender {
     }
 
     // -------- Substring parsing --------
+
+    /**
+     * REWRITE_TOMBSTONE strategy: tombstone every existing live substring,
+     * add ONE new Substring containing the FULL post-edit body. Mirrors what
+     * Mac itself produces when AppleScript `set body` runs (see ref-152233
+     * trace: substring[1]=(1,17)+18 NEW + substring[2]=(1,0)+17 tombstoned).
+     *
+     * Loses CRDT history but matches Mac's own write pattern, so Mac's merge
+     * logic should accept it identically to a Mac self-edit.
+     */
+    fun rewriteWithTombstoneBytes(
+        protoBytes: ByteArray,
+        ourReplicaUuid: ByteArray,
+        appendedText: String,
+        nowEpochSec: Long,
+    ): ByteArray {
+        val kind = NoteBodyEditor.probe(protoBytes)
+        require(kind == NoteProtoKind.NOTE_STORE_PROTO) {
+            "Cannot rewrite a $kind body."
+        }
+
+        val top = ProtobufWire.decode(protoBytes).toMutableList()
+        val versionFieldIndices = top.withIndex()
+            .filter { it.value.fieldNumber == FIELD_OUTER_VERSION && it.value.wireType == ProtobufWire.WIRE_LENGTH_DELIM }
+            .map { it.index }
+        require(versionFieldIndices.size == 1) { "Outer doc has ${versionFieldIndices.size} Versions; expected 1" }
+        val versionIdx = versionFieldIndices[0]
+        val versionFields = ProtobufWire.decode(top[versionIdx].payload).toMutableList()
+        val dataIdx = versionFields.indexOfFirst {
+            it.fieldNumber == FIELD_VERSION_DATA && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        require(dataIdx >= 0) { "Missing Version.data" }
+        val stringFields = ProtobufWire.decode(versionFields[dataIdx].payload).toMutableList()
+
+        val substrings = parseSubstrings(stringFields)
+        require(substrings.isNotEmpty()) { "no substrings" }
+
+        // Sentinel must be the last entry.
+        val sentinel = substrings.last()
+        require(
+            sentinel.charIDReplicaID == SENTINEL_REPLICA_ID && sentinel.charIDClock == SENTINEL_CLOCK,
+        ) { "Last substring is not the sentinel (got ${sentinel.charIDReplicaID},${sentinel.charIDClock})" }
+        val sentinelArrayIdx = sentinel.arrayIdx
+        val sentinelNoteFieldIdx = sentinel.noteFieldIdx
+
+        // Read current note_text.
+        val stringFieldIdx = stringFields.indexOfFirst {
+            it.fieldNumber == FIELD_STRING_STRING && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        require(stringFieldIdx >= 0) { "no String.string" }
+        val originalText = stringFields[stringFieldIdx].payload.decodeToString()
+        val newBody = originalText + appendedText
+
+        // Compute Lamport state.
+        val maxDocCharIDClock = substrings.maxOfOrNull {
+            if (it.charIDReplicaID == SENTINEL_REPLICA_ID && it.charIDClock == SENTINEL_CLOCK) -1L
+            else if (it.length == 0L) it.charIDClock - 1
+            else it.charIDClock + it.length - 1
+        } ?: -1L
+        val maxDocTimestampClock = substrings.maxOfOrNull {
+            if (it.charIDReplicaID == SENTINEL_REPLICA_ID && it.charIDClock == SENTINEL_CLOCK) -1L
+            else it.timestampClock
+        } ?: 0L
+
+        // Find or register OUR replica (same logic as APPEND).
+        val timestampNoteFieldIdx = stringFields.indexOfFirst {
+            it.fieldNumber == FIELD_STRING_TIMESTAMP && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        require(timestampNoteFieldIdx >= 0) { "no VectorTimestamp" }
+        val vtFields = ProtobufWire.decode(stringFields[timestampNoteFieldIdx].payload).toMutableList()
+        val clocks = parseVectorTimestamp(vtFields)
+        val ourClock = clocks.firstOrNull { it.uuid.contentEquals(ourReplicaUuid) }
+        val ourReplicaID: Int
+        val ourClockListIdx: Int
+        val isFirstEdit: Boolean
+        val ourCharIDClockStart: Long
+        if (ourClock != null) {
+            ourReplicaID = ourClock.replicaID
+            ourClockListIdx = ourClock.vtFieldIdx
+            isFirstEdit = false
+            require(ourClock.replicaClocks.size == 2) { "Clock entry needs 2 ReplicaClocks" }
+            ourCharIDClockStart = maxOf(ourClock.replicaClocks[0].clock, maxDocCharIDClock + 1)
+        } else {
+            ourReplicaID = clocks.size + 1
+            ourClockListIdx = vtFields.size
+            isFirstEdit = true
+            // Mac's set-body uses charID.clock = max-doc-clock + 1 (see ref-152233).
+            ourCharIDClockStart = maxDocCharIDClock + 1
+            vtFields.add(buildClockEntry(ourReplicaUuid, ourCharIDClockStart, maxDocTimestampClock))
+            Log.i(TAG, "REWRITE: registered replica idx=$ourReplicaID")
+        }
+
+        val newSubstringLen = newBody.length.toLong()
+        Log.i(
+            TAG,
+            "REWRITE: ourReplica=$ourReplicaID startClock=$ourCharIDClockStart " +
+                "newBodyLen=$newSubstringLen (was ${originalText.length}, +${appendedText.length})",
+        )
+
+        // Tombstone every existing live substring (skip doc-start at index 0 and sentinel at last).
+        for (sub in substrings) {
+            if (sub.arrayIdx == 0) continue // doc-start
+            if (sub.arrayIdx == sentinelArrayIdx) continue // sentinel
+            if (sub.tombstone) continue // already tombstoned
+            val noteFieldIdx = sub.noteFieldIdx
+            val subFields = ProtobufWire.decode(stringFields[noteFieldIdx].payload).toMutableList()
+            // Remove any existing tombstone fields, add tombstone=true.
+            subFields.removeAll {
+                it.fieldNumber == FIELD_SUBSTRING_TOMBSTONE && it.wireType == ProtobufWire.WIRE_VARINT
+            }
+            subFields.add(ProtobufWire.encodeVarintField(FIELD_SUBSTRING_TOMBSTONE, 1L))
+            stringFields[noteFieldIdx] = stringFields[noteFieldIdx].copy(payload = ProtobufWire.encode(subFields))
+        }
+
+        // Bump our replica's counter1 to clock + len, counter2 = max-doc-timestamp.
+        val newCharIDClock = ourCharIDClockStart + newSubstringLen
+        val newTimestampClock = maxDocTimestampClock
+        vtFields[ourClockListIdx] = if (isFirstEdit) {
+            buildClockEntry(ourReplicaUuid, newCharIDClock, newTimestampClock)
+        } else {
+            updateExistingClockInPlace(vtFields[ourClockListIdx], newCharIDClock, newTimestampClock)
+        }
+        stringFields[timestampNoteFieldIdx] =
+            stringFields[timestampNoteFieldIdx].copy(payload = ProtobufWire.encode(vtFields))
+
+        // Replace note_text with the FULL new body bytes.
+        stringFields[stringFieldIdx] = stringFields[stringFieldIdx].copy(payload = newBody.encodeToByteArray())
+
+        // Build new substring with full body length.
+        val ourSubstring = buildSubstring(
+            charIDReplicaID = ourReplicaID.toLong(),
+            charIDClock = ourCharIDClockStart,
+            length = newSubstringLen,
+            timestampReplicaID = ourReplicaID.toLong(),
+            timestampClock = 0L,
+            tombstone = false,
+            children = listOf(sentinelArrayIdx + 1),
+        )
+        // Insert at sentinel's slot, pushing sentinel back.
+        stringFields.add(sentinelNoteFieldIdx, ourSubstring)
+
+        // Rewrite the attribute_runs: drop existing, add ONE covering full body.
+        val attrIdxs = stringFields.withIndex()
+            .filter { it.value.fieldNumber == FIELD_STRING_ATTRIBUTE_RUN && it.value.wireType == ProtobufWire.WIRE_LENGTH_DELIM }
+            .map { it.index }
+            .reversed()
+        val templateFont = lastAttributeRunFont(stringFields)
+        for (idx in attrIdxs) stringFields.removeAt(idx)
+        stringFields.add(buildAttributeRun(length = newBody.length, fontFields = templateFont))
+
+        versionFields[dataIdx] = versionFields[dataIdx].copy(payload = ProtobufWire.encode(stringFields))
+        top[versionIdx] = top[versionIdx].copy(payload = ProtobufWire.encode(versionFields))
+        return ProtobufWire.encode(top)
+    }
 
     private data class ParsedSubstring(
         val noteFieldIdx: Int,   // index in stringFields list

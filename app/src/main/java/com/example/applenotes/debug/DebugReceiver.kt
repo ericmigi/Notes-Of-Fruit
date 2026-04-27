@@ -47,6 +47,14 @@ class DebugReceiver : BroadcastReceiver() {
         val action = intent.action ?: return
         val extras = intent.extras?.keySet()?.associateWith { intent.extras?.get(it) } ?: emptyMap()
         Log.i(TAG, "RECV $action extras=$extras")
+        // Optional `strategy` extra to switch the appender's write pattern.
+        intent.getStringExtra("strategy")?.let { stratStr ->
+            val strat = runCatching { NoteAppender.Strategy.valueOf(stratStr) }.getOrNull()
+            if (strat != null) {
+                NoteAppender.setStrategy(strat)
+                Log.i(TAG, "Strategy set to $strat")
+            }
+        }
         when (action) {
             ACTION_LIST -> launchOp("LIST") { client, _ ->
                 val notes = client.fetchRecents(200)
