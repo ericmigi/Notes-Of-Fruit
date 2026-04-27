@@ -429,8 +429,8 @@ class AppleNotesClient(
             append(relPath)
             append("?remapEnums=true")
             append("&getCurrentSyncToken=true")
-            append("&clientBuildNumber=2426Hotfix3")
-            append("&clientMasteringNumber=2426Hotfix3")
+            append("&clientBuildNumber=2612Build21")
+            append("&clientMasteringNumber=2612Build21")
             append("&clientId=").append(session.clientId)
             append("&dsid=").append(session.dsid)
         }

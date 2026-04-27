@@ -66,8 +66,8 @@ class AppleNotesSession(
 
         val response = httpClient.post("https://setup.icloud.com/setup/ws/1/validate") {
             url {
-                parameters.append("clientBuildNumber", "2426Hotfix3")
-                parameters.append("clientMasteringNumber", "2426Hotfix3")
+                parameters.append("clientBuildNumber", "2612Build21")
+                parameters.append("clientMasteringNumber", "2612Build21")
                 parameters.append("clientId", clientId)
             }
             headers {
