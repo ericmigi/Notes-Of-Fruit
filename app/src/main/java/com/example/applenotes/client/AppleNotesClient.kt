@@ -215,13 +215,29 @@ class AppleNotesClient(
         return record
     }
 
-    /** Soft-delete a note by setting Deleted=1 on its record. */
-    suspend fun deleteNote(recordName: String, recordChangeTag: String): NoteRecord {
-        return modifyFields(
-            recordName = recordName,
-            recordChangeTag = recordChangeTag,
-            fields = mapOf("Deleted" to ("1" to "INT64")),
-        )
+    /**
+     * Delete a note via a hard CloudKit delete operation. Mac/iOS Notes
+     * surface this as moving the note to "Recently Deleted" (server-managed).
+     */
+    suspend fun deleteNote(recordName: String, recordChangeTag: String): String {
+        val payload: JsonObject = buildJsonObject {
+            put("zoneID", buildJsonObject { put("zoneName", "Notes") })
+            putJsonArray("operations") {
+                add(buildJsonObject {
+                    put("operationType", "forceDelete")
+                    put("record", buildJsonObject {
+                        put("recordName", recordName)
+                        put("recordType", "Note")
+                        put("recordChangeTag", recordChangeTag)
+                    })
+                })
+            }
+        }
+        Log.i(TAG, "deleteNote: $recordName tag=$recordChangeTag")
+        val (status, raw) = postJson("/records/modify", payload)
+        Log.i(TAG, "deleteNote response: HTTP $status, ${raw.length}B body[0..400]=${raw.take(400)}")
+        if (status !in 200..299) error("CloudKit deleteNote HTTP $status: ${raw.take(800)}")
+        return raw
     }
 
     /**
