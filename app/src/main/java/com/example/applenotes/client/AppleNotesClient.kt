@@ -262,7 +262,8 @@ class AppleNotesClient(
         }
         val replicaRegistryB64 = record.stringField("ReplicaIDToNotesVersionDataEncrypted")
         if (replicaRegistryB64 != null) {
-            Log.i(TAG, "$label ReplicaIDToNotesVersionDataEncrypted.b64.len=${replicaRegistryB64.length} prefix='${replicaRegistryB64.take(80)}'")
+            Log.i(TAG, "$label ReplicaIDToNotesVersionDataEncrypted.b64.len=${replicaRegistryB64.length}")
+            Log.i(TAG, "$label ReplicaIDToNotesVersion structure:\n${NoteBodyEditor.dumpRawBase64(replicaRegistryB64)}")
         }
     }
 

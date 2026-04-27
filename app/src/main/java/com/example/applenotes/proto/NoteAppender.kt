@@ -8,62 +8,112 @@ private const val TAG = "AppleNotesAppender"
 
 /**
  * Append plain text to the end of a Note's body proto, respecting Apple Notes'
- * "topotext" sequence CRDT.
+ * actual `topotext.String` schema (extracted from the iCloud Notes web bundle).
  *
- * For each character appended:
- *  - note_text (Note.field 2) grows by N UTF-8 bytes.
- *  - A NEW run op is INSERTED before the sentinel (Note.field 3, repeated):
- *      { from = (myReplicaIdx, myCounter),    // CharIDs of the new run
- *        count = N,
- *        to   = (anchorReplicaIdx, anchorClock),
- *        seq  = maxSeqInDoc + 1 }
- *    The "to" anchors the new run to the last visible CharID in the document
- *    (= the last CharID of the penultimate op). For an empty doc, anchor to
- *    (0, 0) — the implicit document-start sentinel.
- *  - Replica registry (Note.field 4): if our UUID is already registered, bump
- *    our entry's first counter by N. If not, append a fresh entry at the end
- *    of the list (UUID + counter=0), THEN bump it by N. Our 1-based replica
- *    index is the position in the entry list.
- *  - attribute_run (Note.field 5): N new entries appended, each length=1 with
- *    the font UUID copied from any existing run.
+ * The proto we're operating on is `topotext.String`:
  *
- * What the previous version got wrong: it bumped the FIRST replica's counter
- * (which was almost certainly a Mac/iPhone, not us) and built ops with
- * `replicaIdx = 1` hardcoded. That forged Mac's identity in the CRDT history;
- * Mac eventually noticed and refused to merge, leaving devices diverged.
+ *     message String {
+ *         optional string string = 2;
+ *         repeated Substring substring = 3;
+ *         optional VectorTimestamp timestamp = 4;
+ *         repeated AttributeRun attributeRun = 5;
+ *         repeated Attachment attachment = 6;
+ *     }
+ *
+ *     message Substring {
+ *         optional CharID charID = 1;        // the run's first char
+ *         optional uint32 length = 2;        // run length, UTF-16 code units
+ *         optional CharID timestamp = 3;     // STYLE timestamp (NOT a tree anchor)
+ *         optional bool tombstone = 4;       // true => deleted
+ *         repeated uint32 child = 5;         // INDICES into String.substring
+ *     }
+ *
+ * The RGA tree is encoded entirely via `Substring.child` — those are indices
+ * into the `substring` repeated field, defining a tree of runs. Visible text =
+ * walk the tree (depth-first), output non-tombstoned chars in order.
+ *
+ * `VectorTimestamp` (field 4) tracks per-replica clocks:
+ *
+ *     message VectorTimestamp {
+ *         message Clock {
+ *             optional bytes replicaUUID = 1;
+ *             repeated ReplicaClock replicaClock = 2;
+ *         }
+ *         repeated Clock clock = 1;
+ *     }
+ *     message ReplicaClock { uint32 clock = 1; uint32 subclock = 2; }
+ *
+ * Each replica gets ONE Clock entry. By Apple's convention there are TWO
+ * ReplicaClock entries: the first holds the replica's next CharID clock to
+ * allocate, the second holds the next style-timestamp clock. (Empirically
+ * verified across multiple notes — entries' first ReplicaClock value matches
+ * `max(charID.clock) + 1` for that replica, second matches `max(timestamp.clock) + 1`.)
+ *
+ * The replica's INDEX (used as `CharID.replicaID`) is its 1-based position in
+ * the `Clock` list. Our previous code wrote `replicaID = 1` claiming to be Mac.
+ * That was the bug.
+ *
+ * What an end-append looks like in this schema:
+ *
+ *  - There is always a doc-start substring at array index 0 with charID=(0,0)
+ *    and a sentinel substring with charID=(0, 4294967295) somewhere in the array.
+ *  - Every existing substring forms a chain via `child[0]` pointers ending at
+ *    the sentinel. Exactly one substring's `child` list contains the sentinel
+ *    index — call that the "tail" substring.
+ *  - To append, insert ourselves between the tail and the sentinel:
+ *       - Add a new Substring at array end with charID=(myReplica, 0..n-1),
+ *         a fresh style timestamp, tombstone=false, child=[sentinelIdx].
+ *       - Rewrite the tail's child list to swap sentinelIdx for our new index.
+ *  - Update VectorTimestamp: find or register our Clock entry; bump its
+ *    ReplicaClock[0].clock by n (chars consumed) and ReplicaClock[1].clock by 1
+ *    (style timestamp consumed).
+ *  - Append n bytes to String.string and add an AttributeRun of length n.
  */
 @OptIn(ExperimentalEncodingApi::class)
 object NoteAppender {
 
-    private const val FIELD_NOTESTOREPROTO_DOCUMENT = 2
-    private const val FIELD_DOCUMENT_NOTE = 3
+    // Outer wrapper is versioned_document.Document → Version → bytes(=topotext.String).
+    // In wire form (matching what we see): outer.field 2 = Version,
+    // Version.field 3 = bytes data (the topotext.String).
+    private const val FIELD_OUTER_VERSION = 2
+    private const val FIELD_VERSION_DATA = 3
 
-    private const val FIELD_NOTE_TEXT = 2
-    private const val FIELD_NOTE_OPS = 3
-    private const val FIELD_NOTE_REPLICAS = 4
-    private const val FIELD_NOTE_ATTRIBUTE_RUN = 5
+    // topotext.String fields
+    private const val FIELD_STRING_STRING = 2
+    private const val FIELD_STRING_SUBSTRING = 3
+    private const val FIELD_STRING_TIMESTAMP = 4
+    private const val FIELD_STRING_ATTRIBUTE_RUN = 5
 
-    private const val FIELD_OP_FROM = 1
-    private const val FIELD_OP_COUNT = 2
-    private const val FIELD_OP_TO = 3
-    private const val FIELD_OP_SEQ = 5
+    // Substring fields
+    private const val FIELD_SUBSTRING_CHARID = 1
+    private const val FIELD_SUBSTRING_LENGTH = 2
+    private const val FIELD_SUBSTRING_TIMESTAMP = 3
+    private const val FIELD_SUBSTRING_TOMBSTONE = 4
+    private const val FIELD_SUBSTRING_CHILD = 5
 
-    private const val FIELD_CHARID_REPLICA = 1
+    // CharID fields
+    private const val FIELD_CHARID_REPLICA_ID = 1
     private const val FIELD_CHARID_CLOCK = 2
 
-    // Note.replicas is a wrapper message; each replica entry uses field number 1
-    // in the wrapper. Inside an entry: field 1 = UUID (16 bytes), field 2
-    // (repeated, length-delim) = counter blocks. Inside a counter block:
-    // field 1 (varint) = counter value.
-    private const val FIELD_REPLICAS_LIST_ENTRY = 1
-    private const val FIELD_REPLICA_ENTRY_UUID = 1
-    private const val FIELD_REPLICA_ENTRY_COUNTER_BLOCK = 2
-    private const val FIELD_COUNTER_BLOCK_VALUE = 1
+    // VectorTimestamp fields
+    private const val FIELD_VT_CLOCK = 1
 
+    // VectorTimestamp.Clock fields
+    private const val FIELD_CLOCK_REPLICA_UUID = 1
+    private const val FIELD_CLOCK_REPLICA_CLOCK = 2
+
+    // ReplicaClock fields
+    private const val FIELD_RC_CLOCK = 1
+    private const val FIELD_RC_SUBCLOCK = 2
+
+    // AttributeRun fields (a tiny subset; see /tmp/apple-notes-real.proto for full schema)
     private const val FIELD_ATTR_LENGTH = 1
-    private const val FIELD_ATTR_FONT = 2
-    private const val FIELD_FONT_UUID = 9
-    private const val FIELD_ATTR_TIMESTAMP = 13
+    private const val FIELD_ATTR_FONT = 3
+    private const val FIELD_FONT_NAME = 1
+    private const val FIELD_FONT_POINT_SIZE = 2
+
+    private const val SENTINEL_REPLICA_ID = 0L
+    private const val SENTINEL_CLOCK = 0xFFFFFFFFL
 
     fun appendBase64(
         textDataEncryptedB64: String,
@@ -88,7 +138,7 @@ object NoteAppender {
     }
 
     fun appendBytes(
-        noteStoreProtoBytes: ByteArray,
+        protoBytes: ByteArray,
         ourReplicaUuid: ByteArray,
         text: String,
         nowEpochSec: Long,
@@ -96,368 +146,464 @@ object NoteAppender {
         require(text.isNotEmpty()) { "Empty append" }
         require(ourReplicaUuid.size == 16) { "ourReplicaUuid must be 16 bytes" }
 
-        val kind = NoteBodyEditor.probe(noteStoreProtoBytes)
+        // ----- Decode the wrapper (versioned_document.Document → Version) -----
+        // The proto says `repeated Version version = 2`. We refuse to operate on
+        // a doc with multiple Version entries — picking the wrong one would update
+        // a stale snapshot while the live data lives elsewhere. Real notes we've
+        // observed only ever ship one.
+        val top = ProtobufWire.decode(protoBytes).toMutableList()
+        val versionFieldIndices = top.withIndex()
+            .filter { it.value.fieldNumber == FIELD_OUTER_VERSION && it.value.wireType == ProtobufWire.WIRE_LENGTH_DELIM }
+            .map { it.index }
+        require(versionFieldIndices.size == 1) {
+            "Outer doc has ${versionFieldIndices.size} Version entries; expected exactly 1"
+        }
+        val versionIdx = versionFieldIndices[0]
+        val versionFields = ProtobufWire.decode(top[versionIdx].payload).toMutableList()
+        val dataIdx = versionFields.indexOfFirst {
+            it.fieldNumber == FIELD_VERSION_DATA && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        require(dataIdx >= 0) { "Missing Version.data field" }
+        val stringFields = ProtobufWire.decode(versionFields[dataIdx].payload).toMutableList()
+
+        // Refuse anything that looks like the modern collaborative MergableData shape.
+        // (`probe()` checks for the absence of String.string-as-text inside Note.note_text;
+        // for end-append on legacy topotext.String we want it to be NOTE_STORE_PROTO.)
+        val kind = NoteBodyEditor.probe(protoBytes)
         require(kind == NoteProtoKind.NOTE_STORE_PROTO) {
-            "Cannot append to a $kind note (modern collaborative MergableData). Not yet supported."
+            "Cannot append to a $kind body. Modern collaborative notes use a different proto."
         }
 
-        // ----- Decode top-level: NoteStoreProto → Document → Note -----
-        val top = ProtobufWire.decode(noteStoreProtoBytes).toMutableList()
-        val docIdx = top.indexOfFirst {
-            it.fieldNumber == FIELD_NOTESTOREPROTO_DOCUMENT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        // ----- Parse all substrings -----
+        val substrings = parseSubstrings(stringFields)
+        require(substrings.isNotEmpty()) { "topotext.String has no substrings at all" }
+
+        // Find the sentinel by its CharID (0, 0xFFFFFFFF).
+        val sentinelArrayIdx = substrings.indexOfFirst {
+            it.charIDReplicaID == SENTINEL_REPLICA_ID && it.charIDClock == SENTINEL_CLOCK
         }
-        require(docIdx >= 0) { "Missing NoteStoreProto.Document" }
-        val docFields = ProtobufWire.decode(top[docIdx].payload).toMutableList()
-        val noteIdx = docFields.indexOfFirst {
-            it.fieldNumber == FIELD_DOCUMENT_NOTE && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        require(sentinelArrayIdx >= 0) {
+            "No sentinel substring (charID=(0, 0xFFFFFFFF)) found"
         }
-        require(noteIdx >= 0) { "Missing Document.Note" }
-        val noteFields = ProtobufWire.decode(docFields[noteIdx].payload).toMutableList()
 
-        val n = text.length // Kotlin String.length is # of UTF-16 code units (= NSString length)
-        val newBytes = text.encodeToByteArray()
-
-        // ----- Step 1: scan replica registry, find-or-register OUR identity -----
-        val replicasIdx = noteFields.indexOfFirst {
-            it.fieldNumber == FIELD_NOTE_REPLICAS && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        // Find the unique tail: the substring whose child[] contains sentinelArrayIdx.
+        val tails = substrings.filter { sentinelArrayIdx in it.children }
+        require(tails.size == 1) {
+            "Expected exactly 1 tail substring pointing to the sentinel; found ${tails.size}. " +
+                "Concurrent edits or unfamiliar tree shape — refusing."
         }
-        require(replicasIdx >= 0) { "Note has no replicas field (field 4)" }
-        val replicaList = ProtobufWire.decode(noteFields[replicasIdx].payload).toMutableList()
-        val scan = scanReplicas(replicaList, ourReplicaUuid)
+        val tail = tails[0]
 
-        var ourReplicaIndex = scan.ourIndex1Based
-        var ourCounter = scan.ourCounter
-        val ourEntryListIdx: Int
+        // ----- Find or register OUR replica in VectorTimestamp -----
+        val timestampNoteFieldIdx = stringFields.indexOfFirst {
+            it.fieldNumber == FIELD_STRING_TIMESTAMP && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        require(timestampNoteFieldIdx >= 0) { "topotext.String has no .timestamp (VectorTimestamp)" }
+        val vtFields = ProtobufWire.decode(stringFields[timestampNoteFieldIdx].payload).toMutableList()
 
-        if (scan.ourIndex1Based < 0) {
-            // Register at the end of the registry. Match Mac's entry shape EXACTLY:
-            // two counter blocks, both initialized to 0. (Real Mac entries always
-            // have two; emitting a single block makes Apple's renderer reject the
-            // proto even when the bytes round-trip through CloudKit storage.)
-            val counterBlockZero = ProtobufWire.encode(
-                listOf(ProtobufWire.encodeVarintField(FIELD_COUNTER_BLOCK_VALUE, 0L)),
-            )
-            val newEntryFields = listOf(
-                ProtobufWire.Field(FIELD_REPLICA_ENTRY_UUID, ProtobufWire.WIRE_LENGTH_DELIM, ourReplicaUuid),
-                ProtobufWire.Field(FIELD_REPLICA_ENTRY_COUNTER_BLOCK, ProtobufWire.WIRE_LENGTH_DELIM, counterBlockZero),
-                ProtobufWire.Field(FIELD_REPLICA_ENTRY_COUNTER_BLOCK, ProtobufWire.WIRE_LENGTH_DELIM, counterBlockZero),
-            )
-            val newEntry = ProtobufWire.Field(
-                FIELD_REPLICAS_LIST_ENTRY,
-                ProtobufWire.WIRE_LENGTH_DELIM,
-                ProtobufWire.encode(newEntryFields),
-            )
-            ourEntryListIdx = replicaList.size
-            replicaList.add(newEntry)
-            ourReplicaIndex = scan.totalEntries + 1
-            ourCounter = 0L
+        val clocks = parseVectorTimestamp(vtFields)
+
+        // Refuse on duplicate UUIDs — replicaID is positional, so duplicates make
+        // CharID.replicaID ambiguous.
+        val seen = HashMap<String, Int>()
+        for (c in clocks) {
+            val key = hex(c.uuid)
+            seen[key]?.let { prev ->
+                error(
+                    "VectorTimestamp corruption: UUID $key appears at replicaID $prev and ${c.replicaID}",
+                )
+            }
+            seen[key] = c.replicaID
+        }
+
+        val matches = clocks.filter { it.uuid.contentEquals(ourReplicaUuid) }
+        require(matches.size <= 1) {
+            "Multiple Clock entries match our UUID — refusing"
+        }
+        val ourClock = matches.firstOrNull()
+
+        val ourReplicaID: Int
+        val ourCharIDClock: Long
+        val ourTimestampClock: Long
+        val ourClockListIdx: Int
+        val isFirstEdit: Boolean
+
+        if (ourClock != null) {
+            // Existing replicas always have exactly two ReplicaClock entries
+            // (Apple's convention: index 0 = next charID clock, index 1 = next
+            // style timestamp). Anything else is a shape we don't understand —
+            // refuse rather than silently default to zero (would re-allocate
+            // CharIDs we'd already issued).
+            require(ourClock.replicaClocks.size == 2) {
+                "Our existing Clock has ${ourClock.replicaClocks.size} ReplicaClock " +
+                    "entries; expected 2"
+            }
+            ourReplicaID = ourClock.replicaID
+            ourCharIDClock = ourClock.replicaClocks[0].clock
+            ourTimestampClock = ourClock.replicaClocks[1].clock
+            ourClockListIdx = ourClock.vtFieldIdx
+            isFirstEdit = false
             Log.i(
                 TAG,
-                "REGISTERED new replica: idx=$ourReplicaIndex uuid=${hex(ourReplicaUuid)} " +
-                    "(coexists with ${scan.totalEntries} existing replicas)",
+                "MATCHED our replica: rid=$ourReplicaID nextCharIDClock=$ourCharIDClock " +
+                    "nextTimestampClock=$ourTimestampClock",
             )
         } else {
-            ourEntryListIdx = scan.ourListIdx
+            ourReplicaID = clocks.size + 1
+            ourCharIDClock = 0L
+            ourTimestampClock = 0L
+            ourClockListIdx = vtFields.size
+            isFirstEdit = true
+            // Append a fresh Clock entry: { uuid, replicaClock=[{clock=0},{clock=0}] }
+            vtFields.add(buildClockEntry(ourReplicaUuid, 0L, 0L))
             Log.i(
                 TAG,
-                "MATCHED existing replica: idx=$ourReplicaIndex counter=$ourCounter " +
-                    "uuid=${hex(ourReplicaUuid)} (this device has edited this note before)",
+                "REGISTERED our replica: rid=$ourReplicaID uuid=${hex(ourReplicaUuid)} " +
+                    "(coexists with ${clocks.size} existing replicas)",
             )
         }
 
-        // ----- Step 2: compute max seq + last visible CharID across the op log -----
-        val opEntries = noteFields.withIndex()
-            .filter { it.value.fieldNumber == FIELD_NOTE_OPS && it.value.wireType == ProtobufWire.WIRE_LENGTH_DELIM }
-        require(opEntries.isNotEmpty()) { "Note has no ops at all (no sentinel)" }
+        // ----- Build our new Substring -----
+        val n = text.length // UTF-16 code units (= NSString length)
+        val ourArrayIdx = substrings.size // index in substring[] AFTER we append
 
-        var maxSeq = 0L
-        for (entry in opEntries) {
-            val sub = ProtobufWire.decode(entry.value.payload)
-            val seq = sub.firstOrNull {
-                it.fieldNumber == FIELD_OP_SEQ && it.wireType == ProtobufWire.WIRE_VARINT
-            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
-            if (seq > maxSeq) maxSeq = seq
-        }
-
-        // Gate: we only know how to extend notes that have exactly one existing
-        // replica with the canonical Mac shape (two counter blocks). Anything else
-        // (no replicas, multiple replicas, single-counter-block entries) is
-        // unfamiliar territory we'd corrupt.
-        val nonUsEntries = scan.allEntries.filter { !it.uuid.contentEquals(ourReplicaUuid) }
-        require(nonUsEntries.size == 1 && nonUsEntries[0].counters.size >= 2) {
-            "Refusing write: expected exactly one non-us replica with two counter " +
-                "blocks. Got ${nonUsEntries.size} non-us entries with counters=" +
-                nonUsEntries.map { it.counters }
-        }
-        val existing = nonUsEntries[0]
-        // Mac's anchor convention (observed empirically across multiple notes):
-        //   to.clock = counter2_of_authoring_replica - 1
-        // Every Mac op uses this same anchor cluster; counter2 advances as Mac
-        // makes new edits. We mimic that: anchor our new run to the same CharID,
-        // and set our own counter2 to anchorClock + 1 after the write so any
-        // future op we author lands at the same end-of-doc marker.
-        val anchorReplica = existing.index.toLong()
-        val anchorClock = existing.counters[1] - 1
-        require(anchorClock >= 0) {
-            "Existing replica has counter2=${existing.counters[1]} which would yield " +
-                "a negative anchor clock"
-        }
-
-        // Inspect every op so unknown/extra fields (e.g. f4 we've seen on real
-        // Mac ops) are visible. Cheap; turns into one log line per op.
-        for ((idx, op) in opEntries.withIndex()) {
-            val label = when (idx) {
-                0 -> "op[0]/doc-start"
-                opEntries.size - 1 -> "op[${idx}]/sentinel"
-                else -> "op[$idx]"
-            }
-            logOp(label, op.value)
-        }
+        val ourSubstring = buildSubstring(
+            charIDReplicaID = ourReplicaID.toLong(),
+            charIDClock = ourCharIDClock,
+            length = n.toLong(),
+            timestampReplicaID = ourReplicaID.toLong(),
+            timestampClock = ourTimestampClock,
+            tombstone = false,
+            children = listOf(sentinelArrayIdx),
+        )
         Log.i(
             TAG,
-            "topo: ourReplica=$ourReplicaIndex ourCounter=$ourCounter " +
-                "anchor=($anchorReplica,$anchorClock) maxSeq=$maxSeq append.n=$n",
+            "topo: ourReplica=$ourReplicaID ourCharIDClock=$ourCharIDClock " +
+                "ourTimestampClock=$ourTimestampClock n=$n  tail.arrayIdx=${tail.arrayIdx} " +
+                "tail.children=${tail.children} sentinel.arrayIdx=$sentinelArrayIdx " +
+                "ourArrayIdx=$ourArrayIdx",
         )
 
-        // ----- Step 3: build the new run op (NEW op, not a bump of an existing one) -----
-        val fromCharId = listOf(
-            ProtobufWire.encodeVarintField(FIELD_CHARID_REPLICA, ourReplicaIndex.toLong()),
-            ProtobufWire.encodeVarintField(FIELD_CHARID_CLOCK, ourCounter),
-        )
-        val toCharId = listOf(
-            ProtobufWire.encodeVarintField(FIELD_CHARID_REPLICA, anchorReplica),
-            ProtobufWire.encodeVarintField(FIELD_CHARID_CLOCK, anchorClock),
-        )
-        val opFields = listOf(
-            ProtobufWire.Field(FIELD_OP_FROM, ProtobufWire.WIRE_LENGTH_DELIM, ProtobufWire.encode(fromCharId)),
-            ProtobufWire.encodeVarintField(FIELD_OP_COUNT, n.toLong()),
-            ProtobufWire.Field(FIELD_OP_TO, ProtobufWire.WIRE_LENGTH_DELIM, ProtobufWire.encode(toCharId)),
-            ProtobufWire.encodeVarintField(FIELD_OP_SEQ, maxSeq + 1),
-        )
-        val newOp = ProtobufWire.Field(
-            FIELD_NOTE_OPS,
-            ProtobufWire.WIRE_LENGTH_DELIM,
-            ProtobufWire.encode(opFields),
-        )
-
-        // ----- Step 4: update OUR replica's counters -----
-        // counter1 (chars authored by us) += n
-        // counter2 (max to-clock used by us + 1) = anchorClock + 1
-        // CRITICAL: do this BEFORE inserting the new op so the in-place write
-        // to noteFields[replicasIdx] uses a valid index. Inserting the op
-        // shifts every noteFields index >= sentinelIdx by +1, including
-        // replicasIdx (which sits at Note.field 4, after Note.field 3 ops).
-        val newCounter1 = ourCounter + n
-        val newCounter2 = anchorClock + 1
-        val ourEntry = replicaList[ourEntryListIdx]
-        val es = ProtobufWire.decode(ourEntry.payload).toMutableList()
-        val counterBlockListIndices = es.withIndex().filter {
-            it.value.fieldNumber == FIELD_REPLICA_ENTRY_COUNTER_BLOCK &&
-                it.value.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-        }.map { it.index }
-        // We register with two counter blocks; existing entries also have two.
-        check(counterBlockListIndices.size >= 2) {
-            "Our replica entry should have at least 2 counter blocks; found " +
-                counterBlockListIndices.size
+        // ----- Rewrite the tail's child list: replace sentinelIdx with ourArrayIdx -----
+        val tailNoteFieldIdx = tail.noteFieldIdx
+        val tailFields = ProtobufWire.decode(stringFields[tailNoteFieldIdx].payload).toMutableList()
+        rewriteSubstringChildren(tailFields) { children ->
+            children.map { if (it == sentinelArrayIdx) ourArrayIdx else it }
         }
-        es[counterBlockListIndices[0]] = es[counterBlockListIndices[0]].copy(
-            payload = ProtobufWire.encode(
-                listOf(ProtobufWire.encodeVarintField(FIELD_COUNTER_BLOCK_VALUE, newCounter1)),
-            ),
-        )
-        es[counterBlockListIndices[1]] = es[counterBlockListIndices[1]].copy(
-            payload = ProtobufWire.encode(
-                listOf(ProtobufWire.encodeVarintField(FIELD_COUNTER_BLOCK_VALUE, newCounter2)),
-            ),
-        )
-        replicaList[ourEntryListIdx] = ourEntry.copy(payload = ProtobufWire.encode(es))
-        noteFields[replicasIdx] = noteFields[replicasIdx].copy(payload = ProtobufWire.encode(replicaList))
-        Log.i(TAG, "ourCounters: c1=$newCounter1 c2=$newCounter2")
+        stringFields[tailNoteFieldIdx] =
+            stringFields[tailNoteFieldIdx].copy(payload = ProtobufWire.encode(tailFields))
 
-        // ----- Step 5: append to note_text (UTF-8 bytes) -----
-        // Modifies noteFields[noteTextIdx] in place at field 2, which is BEFORE
-        // both ops (field 3) and replicas (field 4) so its index never shifts.
-        val noteTextIdx = noteFields.indexOfFirst {
-            it.fieldNumber == FIELD_NOTE_TEXT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        // ----- Update OUR Clock's ReplicaClock entries (clock by n, timestamp by 1) -----
+        val newCharIDClock = ourCharIDClock + n
+        val newTimestampClock = ourTimestampClock + 1
+        vtFields[ourClockListIdx] = if (isFirstEdit) {
+            // Just registered — the entry we built already has clocks=[0,0].
+            // Replace it with the bumped values. No prior subclock/unknown fields
+            // to preserve since we just constructed it.
+            buildClockEntry(ourReplicaUuid, newCharIDClock, newTimestampClock)
+        } else {
+            // In-place update: change only the `clock` varint of each ReplicaClock,
+            // preserving subclock + any unknown fields Apple may add later.
+            updateExistingClockInPlace(
+                vtFields[ourClockListIdx],
+                newCharIDClock,
+                newTimestampClock,
+            )
         }
-        require(noteTextIdx >= 0) { "Missing Note.note_text" }
-        val oldText = noteFields[noteTextIdx].payload
-        noteFields[noteTextIdx] = noteFields[noteTextIdx].copy(payload = oldText + newBytes)
+        stringFields[timestampNoteFieldIdx] =
+            stringFields[timestampNoteFieldIdx].copy(payload = ProtobufWire.encode(vtFields))
 
-        // ----- Step 6: insert the new op before the sentinel -----
-        // (Doing this LAST among the index-shifting mutations means later code
-        // doesn't need to recompute replicasIdx / noteTextIdx.)
-        val sentinelNoteFieldIdx = opEntries.last().index
-        noteFields.add(sentinelNoteFieldIdx, newOp)
-
-        // ----- Step 7: append n attribute_run entries (one per code unit) -----
-        // Adds at the END of noteFields, doesn't shift any earlier index.
-        val fontUuid = findFontUuid(noteFields) ?: ByteArray(16)
-        repeat(n) { i ->
-            noteFields.add(buildAttributeRun(length = 1, fontUuid = fontUuid, ts = nowEpochSec + i))
+        // ----- Append our text to String.string -----
+        val stringFieldIdx = stringFields.indexOfFirst {
+            it.fieldNumber == FIELD_STRING_STRING && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
         }
+        require(stringFieldIdx >= 0) { "topotext.String has no .string field" }
+        stringFields[stringFieldIdx] = stringFields[stringFieldIdx].copy(
+            payload = stringFields[stringFieldIdx].payload + text.encodeToByteArray(),
+        )
 
-        // ----- Step 8: re-encode bottom-up -----
-        docFields[noteIdx] = docFields[noteIdx].copy(payload = ProtobufWire.encode(noteFields))
-        top[docIdx] = top[docIdx].copy(payload = ProtobufWire.encode(docFields))
+        // ----- Insert our new Substring after the last existing substring -----
+        // Doing this AFTER all in-place mutations on stringFields above so the
+        // indices we held (timestampNoteFieldIdx, stringFieldIdx, tailNoteFieldIdx)
+        // remained valid for those mutations. We don't reference them after this point.
+        val lastSubstringNoteFieldIdx = stringFields.withIndex()
+            .filter { it.value.fieldNumber == FIELD_STRING_SUBSTRING && it.value.wireType == ProtobufWire.WIRE_LENGTH_DELIM }
+            .last().index
+        stringFields.add(lastSubstringNoteFieldIdx + 1, ourSubstring)
+
+        // ----- Append a new AttributeRun of length n -----
+        // Inherit the LAST existing AttributeRun's font if present (so our chars
+        // render in a similar style); otherwise emit a minimal run.
+        val templateFont = lastAttributeRunFont(stringFields)
+        stringFields.add(buildAttributeRun(length = n, fontFields = templateFont))
+
+        // ----- Re-encode bottom-up -----
+        versionFields[dataIdx] = versionFields[dataIdx].copy(payload = ProtobufWire.encode(stringFields))
+        top[versionIdx] = top[versionIdx].copy(payload = ProtobufWire.encode(versionFields))
         return ProtobufWire.encode(top)
     }
 
+    // -------- Substring parsing --------
 
-    private fun logOp(label: String, op: ProtobufWire.Field) {
-        val sub = ProtobufWire.decode(op.payload)
-        val from = sub.firstOrNull {
-            it.fieldNumber == FIELD_OP_FROM && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-        }?.let { ProtobufWire.decode(it.payload) }
-        val fromRid = from?.firstOrNull {
-            it.fieldNumber == FIELD_CHARID_REPLICA && it.wireType == ProtobufWire.WIRE_VARINT
-        }?.let { ProtobufWire.decodeVarint(it) }
-        val fromOff = from?.firstOrNull {
-            it.fieldNumber == FIELD_CHARID_CLOCK && it.wireType == ProtobufWire.WIRE_VARINT
-        }?.let { ProtobufWire.decodeVarint(it) }
-        val count = sub.firstOrNull {
-            it.fieldNumber == FIELD_OP_COUNT && it.wireType == ProtobufWire.WIRE_VARINT
-        }?.let { ProtobufWire.decodeVarint(it) }
-        val to = sub.firstOrNull {
-            it.fieldNumber == FIELD_OP_TO && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-        }?.let { ProtobufWire.decode(it.payload) }
-        val toRid = to?.firstOrNull {
-            it.fieldNumber == FIELD_CHARID_REPLICA && it.wireType == ProtobufWire.WIRE_VARINT
-        }?.let { ProtobufWire.decodeVarint(it) }
-        val toOff = to?.firstOrNull {
-            it.fieldNumber == FIELD_CHARID_CLOCK && it.wireType == ProtobufWire.WIRE_VARINT
-        }?.let { ProtobufWire.decodeVarint(it) }
-        val seq = sub.firstOrNull {
-            it.fieldNumber == FIELD_OP_SEQ && it.wireType == ProtobufWire.WIRE_VARINT
-        }?.let { ProtobufWire.decodeVarint(it) }
-        val unknownFields = sub.filter {
-            it.fieldNumber !in setOf(FIELD_OP_FROM, FIELD_OP_COUNT, FIELD_OP_TO, FIELD_OP_SEQ)
-        }.map { "f${it.fieldNumber}/w${it.wireType}/${it.payload.size}b" }
-        Log.i(
-            TAG,
-            "$label op: from=($fromRid,$fromOff) count=$count to=($toRid,$toOff) seq=$seq " +
-                "extra=$unknownFields",
-        )
-    }
-
-    private data class ReplicaSnapshot(
-        /** 1-based replica index (entry position in the registry). */
-        val index: Int,
-        val uuid: ByteArray,
-        /** All counter-block field-1 values, in order. Mac always emits two. */
-        val counters: List<Long>,
+    private data class ParsedSubstring(
+        val noteFieldIdx: Int,   // index in stringFields list
+        val arrayIdx: Int,        // index in substring repeated field (0-based)
+        val charIDReplicaID: Long,
+        val charIDClock: Long,
+        val length: Long,
+        val timestampReplicaID: Long,
+        val timestampClock: Long,
+        val tombstone: Boolean,
+        val children: List<Int>,
     )
 
-    private data class ReplicaScan(
-        /** Position in `replicaList` (the wrapper's internal slot) of OUR entry, or -1. */
-        val ourListIdx: Int,
-        /** 1-based replica index (entry position) of OUR entry, or -1 if not found. */
-        val ourIndex1Based: Int,
-        /** Current counter[0] value for OUR entry, or 0 if not found. */
-        val ourCounter: Long,
-        /** Total number of replica entries in the registry. */
-        val totalEntries: Int,
-        /** All entries' parsed snapshots — used by callers needing the registry shape. */
-        val allEntries: List<ReplicaSnapshot>,
-    )
-
-    /**
-     * Scan `Note.replicas` once: log every entry's UUID and counter, detect
-     * duplicate-UUID corruption (refuses if found), and locate OUR entry by
-     * UUID. Returns a snapshot we can act on.
-     */
-    private fun scanReplicas(
-        replicaList: List<ProtobufWire.Field>,
-        ourUuid: ByteArray,
-    ): ReplicaScan {
-        var ourListIdx = -1
-        var ourIndex = -1
-        var ourCounter = 0L
-        var entriesSeen = 0
-        val sb = StringBuilder()
-        val seenUuids = HashMap<String, Int>()
-        val allEntries = mutableListOf<ReplicaSnapshot>()
-        for ((listIdx, f) in replicaList.withIndex()) {
-            if (f.fieldNumber != FIELD_REPLICAS_LIST_ENTRY ||
+    private fun parseSubstrings(stringFields: List<ProtobufWire.Field>): List<ParsedSubstring> {
+        val out = mutableListOf<ParsedSubstring>()
+        var arrayIdx = 0
+        for ((listIdx, f) in stringFields.withIndex()) {
+            if (f.fieldNumber != FIELD_STRING_SUBSTRING ||
                 f.wireType != ProtobufWire.WIRE_LENGTH_DELIM
             ) continue
-            entriesSeen++
-            val es = ProtobufWire.decode(f.payload)
-            val uuidField = es.firstOrNull {
-                it.fieldNumber == FIELD_REPLICA_ENTRY_UUID &&
-                    it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-            }
-            val uuidBytes = uuidField?.payload ?: ByteArray(0)
-            val uuidHex = if (uuidBytes.isEmpty()) "<no-uuid>" else hex(uuidBytes)
-            // Collect ALL counter-block values (Mac emits two; ours starts as two zeroes).
-            val counters = es.filter {
-                it.fieldNumber == FIELD_REPLICA_ENTRY_COUNTER_BLOCK &&
-                    it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-            }.map { cb ->
-                ProtobufWire.decode(cb.payload).firstOrNull { fld ->
-                    fld.fieldNumber == FIELD_COUNTER_BLOCK_VALUE &&
-                        fld.wireType == ProtobufWire.WIRE_VARINT
+            val sub = ProtobufWire.decode(f.payload)
+            val charID = sub.firstOrNull {
+                it.fieldNumber == FIELD_SUBSTRING_CHARID && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }?.let { ProtobufWire.decode(it.payload) }
+            val charIDReplica = charID?.firstOrNull {
+                it.fieldNumber == FIELD_CHARID_REPLICA_ID && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+            val charIDClock = charID?.firstOrNull {
+                it.fieldNumber == FIELD_CHARID_CLOCK && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+            val length = sub.firstOrNull {
+                it.fieldNumber == FIELD_SUBSTRING_LENGTH && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+            val timestamp = sub.firstOrNull {
+                it.fieldNumber == FIELD_SUBSTRING_TIMESTAMP && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }?.let { ProtobufWire.decode(it.payload) }
+            val tsReplica = timestamp?.firstOrNull {
+                it.fieldNumber == FIELD_CHARID_REPLICA_ID && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+            val tsClock = timestamp?.firstOrNull {
+                it.fieldNumber == FIELD_CHARID_CLOCK && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+            val tombstone = sub.firstOrNull {
+                it.fieldNumber == FIELD_SUBSTRING_TOMBSTONE && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) != 0L } ?: false
+            // child is `repeated uint32` — non-packed (proto2), so multiple field-5 varints.
+            val children = sub.filter {
+                it.fieldNumber == FIELD_SUBSTRING_CHILD && it.wireType == ProtobufWire.WIRE_VARINT
+            }.map { ProtobufWire.decodeVarint(it).toInt() }
+            out.add(
+                ParsedSubstring(
+                    noteFieldIdx = listIdx,
+                    arrayIdx = arrayIdx,
+                    charIDReplicaID = charIDReplica,
+                    charIDClock = charIDClock,
+                    length = length,
+                    timestampReplicaID = tsReplica,
+                    timestampClock = tsClock,
+                    tombstone = tombstone,
+                    children = children,
+                ),
+            )
+            arrayIdx++
+        }
+        return out
+    }
+
+    private fun rewriteSubstringChildren(
+        substringFields: MutableList<ProtobufWire.Field>,
+        rewrite: (List<Int>) -> List<Int>,
+    ) {
+        val oldChildren = substringFields.filter {
+            it.fieldNumber == FIELD_SUBSTRING_CHILD && it.wireType == ProtobufWire.WIRE_VARINT
+        }.map { ProtobufWire.decodeVarint(it).toInt() }
+        val newChildren = rewrite(oldChildren)
+        // Remove all existing field-5 entries.
+        substringFields.removeAll {
+            it.fieldNumber == FIELD_SUBSTRING_CHILD && it.wireType == ProtobufWire.WIRE_VARINT
+        }
+        // Append the new ones at the end (proto2 repeated allows any position;
+        // canonical encoding generally clusters them at the field's logical place).
+        for (c in newChildren) {
+            substringFields.add(ProtobufWire.encodeVarintField(FIELD_SUBSTRING_CHILD, c.toLong()))
+        }
+    }
+
+    // -------- VectorTimestamp parsing --------
+
+    private data class ParsedClock(
+        val vtFieldIdx: Int,    // index in vtFields list
+        val replicaID: Int,      // 1-based position among Clock entries
+        val uuid: ByteArray,
+        val replicaClocks: List<ParsedReplicaClock>,
+    )
+
+    private data class ParsedReplicaClock(val clock: Long, val subclock: Long)
+
+    private fun parseVectorTimestamp(vtFields: List<ProtobufWire.Field>): List<ParsedClock> {
+        val out = mutableListOf<ParsedClock>()
+        var rid = 0
+        for ((listIdx, f) in vtFields.withIndex()) {
+            if (f.fieldNumber != FIELD_VT_CLOCK ||
+                f.wireType != ProtobufWire.WIRE_LENGTH_DELIM
+            ) continue
+            rid++
+            val clk = ProtobufWire.decode(f.payload)
+            val uuid = clk.firstOrNull {
+                it.fieldNumber == FIELD_CLOCK_REPLICA_UUID && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }?.payload ?: ByteArray(0)
+            val replicaClocks = clk.filter {
+                it.fieldNumber == FIELD_CLOCK_REPLICA_CLOCK && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }.map { rcField ->
+                val rc = ProtobufWire.decode(rcField.payload)
+                val clock = rc.firstOrNull {
+                    it.fieldNumber == FIELD_RC_CLOCK && it.wireType == ProtobufWire.WIRE_VARINT
                 }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+                val subclock = rc.firstOrNull {
+                    it.fieldNumber == FIELD_RC_SUBCLOCK && it.wireType == ProtobufWire.WIRE_VARINT
+                }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+                ParsedReplicaClock(clock, subclock)
             }
-            val isUs = uuidBytes.contentEquals(ourUuid)
-            sb.append("  #").append(entriesSeen).append(" uuid=").append(uuidHex)
-                .append(" counters=").append(counters)
-            if (isUs) sb.append("  <-- US")
-            sb.append('\n')
-
-            seenUuids[uuidHex]?.let { prev ->
-                error(
-                    "Replica registry corruption: UUID $uuidHex appears at entries " +
-                        "$prev and $entriesSeen — refusing to write to avoid making it worse",
-                )
-            }
-            seenUuids[uuidHex] = entriesSeen
-
-            allEntries.add(ReplicaSnapshot(entriesSeen, uuidBytes, counters))
-
-            if (isUs) {
-                ourListIdx = listIdx
-                ourIndex = entriesSeen
-                ourCounter = counters.firstOrNull() ?: 0L
-            }
+            out.add(ParsedClock(listIdx, rid, uuid, replicaClocks))
         }
-        Log.i(
-            TAG,
-            "Replica scan: ${entriesSeen} existing entries, ourUuid=${hex(ourUuid)}\n$sb" +
-                "  decision=" + if (ourIndex < 0) "register-new" else "match-existing#$ourIndex",
-        )
-        return ReplicaScan(ourListIdx, ourIndex, ourCounter, entriesSeen, allEntries)
+        return out
     }
 
-    private fun findFontUuid(noteFields: List<ProtobufWire.Field>): ByteArray? {
-        for (f in noteFields) {
-            if (f.fieldNumber != FIELD_NOTE_ATTRIBUTE_RUN || f.wireType != ProtobufWire.WIRE_LENGTH_DELIM) continue
-            val subs = ProtobufWire.decode(f.payload)
-            val fontField = subs.firstOrNull {
-                it.fieldNumber == FIELD_ATTR_FONT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
-            } ?: continue
-            val fontSubs = ProtobufWire.decode(fontField.payload)
-            val uuidField = fontSubs.firstOrNull {
-                it.fieldNumber == FIELD_FONT_UUID && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+    // -------- Builders --------
+
+    /**
+     * Update only the `clock` varint of each ReplicaClock inside an existing
+     * Clock entry. Preserves the UUID, subclock fields, any other ReplicaClock
+     * fields we don't recognize, and any unknown fields Apple may add. Caller
+     * must guarantee there are exactly 2 ReplicaClock entries.
+     */
+    private fun updateExistingClockInPlace(
+        existingClockField: ProtobufWire.Field,
+        newCharIDClock: Long,
+        newTimestampClock: Long,
+    ): ProtobufWire.Field {
+        val clockFields = ProtobufWire.decode(existingClockField.payload).toMutableList()
+        val rcIndices = clockFields.withIndex()
+            .filter {
+                it.value.fieldNumber == FIELD_CLOCK_REPLICA_CLOCK &&
+                    it.value.wireType == ProtobufWire.WIRE_LENGTH_DELIM
             }
-            if (uuidField != null && uuidField.payload.size == 16) return uuidField.payload
+            .map { it.index }
+        check(rcIndices.size == 2) {
+            "Expected exactly 2 ReplicaClock entries, found ${rcIndices.size}"
         }
-        return null
+        clockFields[rcIndices[0]] = updateReplicaClockInPlace(clockFields[rcIndices[0]], newCharIDClock)
+        clockFields[rcIndices[1]] = updateReplicaClockInPlace(clockFields[rcIndices[1]], newTimestampClock)
+        return existingClockField.copy(payload = ProtobufWire.encode(clockFields))
     }
 
-    private fun buildAttributeRun(length: Int, fontUuid: ByteArray, ts: Long): ProtobufWire.Field {
-        val fontInner = listOf(
-            ProtobufWire.Field(FIELD_FONT_UUID, ProtobufWire.WIRE_LENGTH_DELIM, fontUuid),
+    private fun updateReplicaClockInPlace(
+        rcField: ProtobufWire.Field,
+        newClock: Long,
+    ): ProtobufWire.Field {
+        val rcFields = ProtobufWire.decode(rcField.payload).toMutableList()
+        val clockIdx = rcFields.indexOfFirst {
+            it.fieldNumber == FIELD_RC_CLOCK && it.wireType == ProtobufWire.WIRE_VARINT
+        }
+        if (clockIdx >= 0) {
+            rcFields[clockIdx] = ProtobufWire.encodeVarintField(FIELD_RC_CLOCK, newClock)
+        } else {
+            rcFields.add(0, ProtobufWire.encodeVarintField(FIELD_RC_CLOCK, newClock))
+        }
+        return rcField.copy(payload = ProtobufWire.encode(rcFields))
+    }
+
+    private fun buildClockEntry(uuid: ByteArray, charIDClock: Long, timestampClock: Long): ProtobufWire.Field {
+        // Always emit two ReplicaClocks to match Mac's shape.
+        val rc0 = ProtobufWire.encode(
+            listOf(ProtobufWire.encodeVarintField(FIELD_RC_CLOCK, charIDClock)),
         )
-        val runFields = listOf(
-            ProtobufWire.encodeVarintField(FIELD_ATTR_LENGTH, length.toLong()),
-            ProtobufWire.Field(FIELD_ATTR_FONT, ProtobufWire.WIRE_LENGTH_DELIM, ProtobufWire.encode(fontInner)),
-            ProtobufWire.encodeVarintField(FIELD_ATTR_TIMESTAMP, ts),
+        val rc1 = ProtobufWire.encode(
+            listOf(ProtobufWire.encodeVarintField(FIELD_RC_CLOCK, timestampClock)),
+        )
+        val clockFields = listOf(
+            ProtobufWire.Field(FIELD_CLOCK_REPLICA_UUID, ProtobufWire.WIRE_LENGTH_DELIM, uuid),
+            ProtobufWire.Field(FIELD_CLOCK_REPLICA_CLOCK, ProtobufWire.WIRE_LENGTH_DELIM, rc0),
+            ProtobufWire.Field(FIELD_CLOCK_REPLICA_CLOCK, ProtobufWire.WIRE_LENGTH_DELIM, rc1),
         )
         return ProtobufWire.Field(
-            FIELD_NOTE_ATTRIBUTE_RUN,
+            FIELD_VT_CLOCK,
             ProtobufWire.WIRE_LENGTH_DELIM,
-            ProtobufWire.encode(runFields),
+            ProtobufWire.encode(clockFields),
+        )
+    }
+
+    private fun buildSubstring(
+        charIDReplicaID: Long,
+        charIDClock: Long,
+        length: Long,
+        timestampReplicaID: Long,
+        timestampClock: Long,
+        tombstone: Boolean,
+        children: List<Int>,
+    ): ProtobufWire.Field {
+        val charID = ProtobufWire.encode(
+            listOf(
+                ProtobufWire.encodeVarintField(FIELD_CHARID_REPLICA_ID, charIDReplicaID),
+                ProtobufWire.encodeVarintField(FIELD_CHARID_CLOCK, charIDClock),
+            ),
+        )
+        val timestamp = ProtobufWire.encode(
+            listOf(
+                ProtobufWire.encodeVarintField(FIELD_CHARID_REPLICA_ID, timestampReplicaID),
+                ProtobufWire.encodeVarintField(FIELD_CHARID_CLOCK, timestampClock),
+            ),
+        )
+        val fields = mutableListOf<ProtobufWire.Field>()
+        fields.add(ProtobufWire.Field(FIELD_SUBSTRING_CHARID, ProtobufWire.WIRE_LENGTH_DELIM, charID))
+        fields.add(ProtobufWire.encodeVarintField(FIELD_SUBSTRING_LENGTH, length))
+        fields.add(ProtobufWire.Field(FIELD_SUBSTRING_TIMESTAMP, ProtobufWire.WIRE_LENGTH_DELIM, timestamp))
+        if (tombstone) {
+            fields.add(ProtobufWire.encodeVarintField(FIELD_SUBSTRING_TOMBSTONE, 1L))
+        }
+        for (child in children) {
+            fields.add(ProtobufWire.encodeVarintField(FIELD_SUBSTRING_CHILD, child.toLong()))
+        }
+        return ProtobufWire.Field(
+            FIELD_STRING_SUBSTRING,
+            ProtobufWire.WIRE_LENGTH_DELIM,
+            ProtobufWire.encode(fields),
+        )
+    }
+
+    private fun lastAttributeRunFont(stringFields: List<ProtobufWire.Field>): List<ProtobufWire.Field> {
+        // Find the last attribute_run that has a font field, return its font's inner fields.
+        val attrRuns = stringFields.filter {
+            it.fieldNumber == FIELD_STRING_ATTRIBUTE_RUN && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        for (run in attrRuns.reversed()) {
+            val sub = ProtobufWire.decode(run.payload)
+            val font = sub.firstOrNull {
+                it.fieldNumber == FIELD_ATTR_FONT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            } ?: continue
+            return ProtobufWire.decode(font.payload)
+        }
+        return emptyList()
+    }
+
+    private fun buildAttributeRun(length: Int, fontFields: List<ProtobufWire.Field>): ProtobufWire.Field {
+        val fields = mutableListOf<ProtobufWire.Field>(
+            ProtobufWire.encodeVarintField(FIELD_ATTR_LENGTH, length.toLong()),
+        )
+        if (fontFields.isNotEmpty()) {
+            fields.add(
+                ProtobufWire.Field(
+                    FIELD_ATTR_FONT,
+                    ProtobufWire.WIRE_LENGTH_DELIM,
+                    ProtobufWire.encode(fontFields),
+                ),
+            )
+        }
+        return ProtobufWire.Field(
+            FIELD_STRING_ATTRIBUTE_RUN,
+            ProtobufWire.WIRE_LENGTH_DELIM,
+            ProtobufWire.encode(fields),
         )
     }
 

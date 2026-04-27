@@ -354,6 +354,47 @@ object NoteBodyEditor {
     }.getOrElse { "summarize_b64_failed: ${it.message}" }
 
     /**
+     * Recursive structural dump of a protobuf payload that ISN'T gzipped (e.g.
+     * `ReplicaIDToNotesVersionDataEncrypted` — name is misleading; it's plain
+     * protobuf in CloudKit, despite the "Encrypted" suffix).
+     */
+    fun dumpRawBase64(b64: String): String = runCatching {
+        val bytes = Base64.decode(b64)
+        val sb = StringBuilder()
+        sb.append("bytes=").append(bytes.size).append('\n')
+        dumpFields(sb, ProtobufWire.decode(bytes), depth = 1)
+        sb.toString()
+    }.getOrElse { "dump_raw_failed: ${it.message}" }
+
+    private fun dumpFields(sb: StringBuilder, fields: List<ProtobufWire.Field>, depth: Int) {
+        val indent = "  ".repeat(depth)
+        for (f in fields) {
+            sb.append(indent).append("f").append(f.fieldNumber)
+                .append("/w").append(f.wireType).append("/sz").append(f.payload.size)
+            when (f.wireType) {
+                ProtobufWire.WIRE_VARINT -> sb.append("  v=").append(ProtobufWire.decodeVarint(f))
+                ProtobufWire.WIRE_LENGTH_DELIM -> {
+                    val nested = runCatching { ProtobufWire.decode(f.payload) }.getOrNull()
+                    if (nested != null && nested.isNotEmpty() && depth < 8) {
+                        sb.append('\n')
+                        dumpFields(sb, nested, depth + 1)
+                        continue
+                    } else if (f.payload.size <= 32) {
+                        sb.append("  hex=").append(
+                            f.payload.joinToString("") {
+                                ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1)
+                            },
+                        )
+                    } else {
+                        sb.append("  bytes")
+                    }
+                }
+            }
+            sb.append('\n')
+        }
+    }
+
+    /**
      * Full structural dump of `Note.replicas` — every replica entry, every
      * inner field (numbered), every counter block. Used as ground-truth to
      * design our own registration. Multi-line.

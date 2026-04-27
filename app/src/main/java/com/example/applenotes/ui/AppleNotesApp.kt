@@ -222,19 +222,34 @@ fun AppleNotesApp() {
                     }
                 }
             },
-            onSave = { _, _ ->
-                // Locked: every append heuristic we've tried mis-anchors our op
-                // in Apple's RGA replay and ends up rendering at a wrong logical
-                // position. Until we have the actual proto schema + RGA semantics,
-                // refuse all writes to avoid corrupting more notes.
+            onSave = { newBody, isPureAppend ->
                 scope.launch {
-                    state = ScreenState.Error(
-                        "Writes are temporarily disabled. The CRDT op-log semantics " +
-                            "we're using cause Apple Notes / iCloud.com to render at " +
-                            "wrong positions even though writes succeed. Investigation " +
-                            "is in progress — needs Apple's real proto schema before we " +
-                            "can write safely.",
-                    )
+                    saving = true
+                    try {
+                        val uuid = ourReplicaUuid
+                            ?: error("Device replica UUID not loaded yet — try again in a moment.")
+                        val tag = s.record.recordChangeTag
+                            ?: error("No recordChangeTag — refresh first.")
+                        val textB64 = s.record.stringField("TextDataEncrypted")
+                            ?: error("No body field on this note.")
+                        val originalBody = NoteBodyEditor.readTextFromBase64(textB64).orEmpty()
+                        val now = System.currentTimeMillis() / 1000L
+                        check(isPureAppend) {
+                            "Only pure-append edits are supported — mid-string changes need " +
+                                "tree-split semantics that aren't implemented yet."
+                        }
+                        val appended = newBody.removePrefix(originalBody)
+                        require(appended.isNotEmpty()) { "Pure-append marked but no new chars" }
+                        val newB64 = NoteAppender.appendBase64(textB64, uuid, appended, now)
+                        val updated = AppleNotesClient(httpClient, s.session)
+                            .modifyNoteBody(s.record.recordName, tag, newB64)
+                        state = ScreenState.Detail(s.session, updated)
+                    } catch (e: Throwable) {
+                        Log.e(TAG, "save failed", e)
+                        state = ScreenState.Error(e.message ?: e.toString())
+                    } finally {
+                        saving = false
+                    }
                 }
             },
             onDelete = {
