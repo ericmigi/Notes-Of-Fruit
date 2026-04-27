@@ -117,6 +117,7 @@ fun AppleNotesApp() {
     var state by remember { mutableStateOf<ScreenState>(ScreenState.Splash) }
     var saving by remember { mutableStateOf(false) }
     var ourReplicaUuid by remember { mutableStateOf<ByteArray?>(null) }
+    var lastSavedHint by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(Unit) {
@@ -211,6 +212,8 @@ fun AppleNotesApp() {
         is ScreenState.Detail -> NoteDetailScreen(
             record = s.record,
             saving = saving,
+            savedHint = lastSavedHint,
+            onHintShown = { lastSavedHint = null },
             onBack = {
                 // Re-fetch list to pick up our edits
                 scope.launch {
@@ -260,6 +263,7 @@ fun AppleNotesApp() {
                             newSnippet = newSnippet.takeIf { it != oldSnippet },
                         )
                         state = ScreenState.Detail(s.session, updated)
+                        lastSavedHint = "Saved to iCloud. Mac users may need to quit & reopen Notes.app to see changes."
                     } catch (e: Throwable) {
                         Log.e(TAG, "save failed", e)
                         state = ScreenState.Error(e.message ?: e.toString())
@@ -482,7 +486,16 @@ private fun NoteDetailScreen(
     onSave: (newBody: String, isPureAppend: Boolean) -> Unit,
     onDelete: () -> Unit,
     saving: Boolean,
+    savedHint: String? = null,
+    onHintShown: () -> Unit = {},
 ) {
+    val snackbarHostState = remember { SnackbarHostState() }
+    LaunchedEffect(savedHint) {
+        if (savedHint != null) {
+            snackbarHostState.showSnackbar(savedHint)
+            onHintShown()
+        }
+    }
     val originalBody = remember(record.recordName, record.recordChangeTag) {
         record.stringField("TextDataEncrypted")?.let { b64 ->
             runCatching { NoteBodyEditor.readTextFromBase64(b64) }.getOrNull()
@@ -502,6 +515,7 @@ private fun NoteDetailScreen(
 
     Scaffold(
         modifier = Modifier.imePadding(),
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             Column {
                 TopAppBar(
