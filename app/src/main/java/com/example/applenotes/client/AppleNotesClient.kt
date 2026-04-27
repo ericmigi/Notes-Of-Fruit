@@ -252,6 +252,11 @@ class AppleNotesClient(
             val tag = if (sentB64 != null) " matchesSent=${textB64 == sentB64}" else ""
             Log.i(TAG, "$label TextDataEncrypted.b64.len=${textB64.length}$tag")
             Log.i(TAG, "$label TextDataEncrypted proto: ${NoteBodyEditor.summarizeBase64(textB64)}")
+            // Full replica entry dump — ground-truth structure for designing
+            // our own registration. Multi-line; only logged for lookups.
+            if (label == "lookupNote") {
+                Log.i(TAG, "$label replicas dump:\n${NoteBodyEditor.dumpReplicasBase64(textB64)}")
+            }
         } else {
             Log.i(TAG, "$label has no TextDataEncrypted in returned fields (keys=${record.rawFields.keys})")
         }
