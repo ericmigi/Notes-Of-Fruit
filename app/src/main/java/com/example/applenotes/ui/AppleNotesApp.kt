@@ -148,6 +148,19 @@ private sealed interface ScreenState {
         val notesCache: List<NoteSummary>,
         val folders: List<FolderSummary>,
         val selectedFolder: String?,
+        /**
+         * Set when this Detail represents a brand-new note that has NOT yet
+         * been written to iCloud. The first save calls `createNote` with the
+         * user's typed content (title + body in one shot); subsequent saves
+         * use `modifyNoteBody`. We match iCloud.com's pattern: it never does
+         * empty-create-then-modify — it only creates the record once there's
+         * content to write. Empty-create + modify races Mac's notesync
+         * housekeeping and produces records Mac later trashes.
+         *
+         * When non-null, [record] is a stub (recordChangeTag = null,
+         * recordName = "", empty fields).
+         */
+        val pendingFolderRef: kotlinx.serialization.json.JsonElement? = null,
     ) : ScreenState
 }
 
@@ -289,11 +302,11 @@ fun AppleNotesApp() {
                     state = ScreenState.Loading("Creating note…")
                     state = try {
                         val client = AppleNotesClient(httpClient, s.session)
-                        // Grab a Folder ref from any existing note (CloudKit
-                        // requires a CKReference to attach the new note to).
-                        // Prefer one from the currently-selected folder so
-                        // the new note lands in the same folder the user is
-                        // viewing.
+                        // Grab a Folder CKReference from any existing note in
+                        // the user-visible set. We need this BEFORE the user
+                        // types anything because createNote requires a folder
+                        // ref. Prefer the currently-selected folder so the
+                        // new note lands where the user is browsing.
                         val sample = s.notes
                             .firstOrNull { it.folderRecordName == s.selectedFolder }
                             ?: s.notes.firstOrNull { it.folderRecordName != TRASH_RECORD_NAME }
@@ -301,27 +314,36 @@ fun AppleNotesApp() {
                         val sampleRecord = client.lookupNote(sample.recordName)
                         val folderRef = sampleRecord.rawFields["Folder"]
                             ?: error("Sample note has no Folder field")
-                        // Create with empty title + body. The user types and
-                        // the first non-blank line becomes the title.
-                        val created = client.createNote(
-                            title = "",
-                            body = "",
-                            folderRef = folderRef,
-                            ourReplicaUuid = uuid,
+                        // DEFERRED CREATE: do NOT call createNote yet. iCloud.com
+                        // doesn't either — clicking "new note" just opens an
+                        // empty editor; the server-side record only gets
+                        // created on the first save with the user's actual
+                        // content. Empty-create-then-modify races Mac's
+                        // notesync housekeeping and produces records that
+                        // Mac later trashes (we observed this: notes appearing
+                        // briefly then vanishing on Mac restart).
+                        //
+                        // The draft gets a unique local recordName ("draft-<uuid>")
+                        // so the post-save state-update can disambiguate
+                        // multiple drafts in flight (back, FAB-again, type,
+                        // save races back into the original Detail).
+                        val draftId = "draft-" + java.util.UUID.randomUUID().toString()
+                        val draftRecord = NoteRecord(
+                            recordName = draftId,
+                            recordType = "Note",
+                            recordChangeTag = null,
+                            rawFields = emptyMap(),
                         )
-                        // Pre-pend the new (empty) summary into the cache so
-                        // back-nav shows it immediately without a refetch.
-                        val newSummary = NoteSummary(
-                            recordName = created.recordName,
-                            title = null,
-                            snippet = null,
-                            modificationTimestampMs = System.currentTimeMillis(),
-                            deleted = false,
-                            folderRecordName = sample.folderRecordName,
+                        ScreenState.Detail(
+                            session = s.session,
+                            record = draftRecord,
+                            notesCache = s.notes,
+                            folders = s.folders,
+                            selectedFolder = s.selectedFolder,
+                            pendingFolderRef = folderRef,
                         )
-                        ScreenState.Detail(s.session, created, listOf(newSummary) + s.notes, s.folders, s.selectedFolder)
                     } catch (e: Throwable) {
-                        Log.e(TAG, "createNote failed", e)
+                        Log.e(TAG, "createNote (folder lookup) failed", e)
                         ScreenState.Error(e.message ?: e.toString())
                     }
                 }
@@ -349,56 +371,103 @@ fun AppleNotesApp() {
                     try {
                         val uuid = ourReplicaUuid
                             ?: error("Device replica UUID not loaded yet — try again in a moment.")
-                        val tag = s.record.recordChangeTag
-                            ?: error("No recordChangeTag — refresh first.")
-                        val textB64 = s.record.stringField("TextDataEncrypted")
-                            ?: error("No body field on this note.")
-                        val originalBody = NoteBodyEditor.readVisibleTextFromBase64(textB64)
-                            ?: NoteBodyEditor.readTextFromBase64(textB64).orEmpty()
-                        val now = System.currentTimeMillis() / 1000L
-                        // Pure-append edits go through the cheap APPEND path (one
-                        // new substring at the sentinel slot). Anything else
-                        // (replace/insert/delete in the middle) goes through the
-                        // splice path which mirrors iCloud.com's pattern: slot
-                        // promotion + split-and-tombstone with fresh ts on the
-                        // tombstones + new chunks for inserted text.
-                        val newB64 = if (isPureAppend) {
-                            val appended = newBody.removePrefix(originalBody)
-                            require(appended.isNotEmpty()) { "Pure-append marked but no new chars" }
-                            NoteAppender.appendBase64(textB64, uuid, appended, now)
-                        } else {
-                            NoteAppender.setBodyBase64(textB64, uuid, newBody, now)
-                        }
-                        // Compute new title and snippet from the post-append body so
-                        // Apple's Title/Snippet CloudKit fields stay in sync. Apple's
-                        // clients (Mac, iCloud.com list view, our own list view) use
-                        // these fields for "did this note visibly change?".
+                        val client = AppleNotesClient(httpClient, s.session)
                         val (newTitle, newSnippet) = computeTitleAndSnippet(newBody)
-                        val (oldTitle, oldSnippet) = computeTitleAndSnippet(originalBody)
-                        Log.i(
-                            TAG,
-                            "save: title '${oldTitle.take(30)}'->'${newTitle.take(30)}' " +
-                                "snippet '${oldSnippet.take(30)}'->'${newSnippet.take(30)}'",
-                        )
-                        val updated = AppleNotesClient(httpClient, s.session).modifyNoteBody(
-                            s.record.recordName,
-                            tag,
-                            newB64,
-                            newTitle = newTitle.takeIf { it != oldTitle },
-                            newSnippet = newSnippet.takeIf { it != oldSnippet },
-                            replicaVersionPassThroughB64 = s.record.stringField("ReplicaIDToNotesVersionDataEncrypted"),
-                        )
-                        // Patch the cached list summary for this note so when the
-                        // user navigates back they see the updated snippet/title
-                        // without a refetch.
-                        val patchedCache = s.notesCache.map { note ->
-                            if (note.recordName == s.record.recordName) {
-                                note.copy(
-                                    title = newTitle,
-                                    snippet = newSnippet,
-                                    modificationTimestampMs = System.currentTimeMillis(),
-                                )
-                            } else note
+
+                        val updated: NoteRecord
+                        val patchedCache: List<NoteSummary>
+
+                        if (s.record.recordChangeTag == null) {
+                            // DRAFT: this is the first save for a FAB-created
+                            // note. Call createNote with the typed content in
+                            // one shot — matching iCloud.com's pattern. The
+                            // proto produced by NoteCreator already has the
+                            // full content as a single substring + matching
+                            // attribute_run, so Mac's notesync sees a
+                            // self-consistent record on first sight.
+                            val folderRef = s.pendingFolderRef
+                                ?: error("Draft has no folderRef — refresh first.")
+                            // Split fullBodyForSave back into title + body the
+                            // same way it was assembled upstream (line 945-950
+                            // in NoteDetailScreen): the first '\n' is the
+                            // title/body separator. computeTitleAndSnippet's
+                            // `newTitle` is derived heuristically (first
+                            // non-blank line, possibly trimmed) and would
+                            // misbehave under leading whitespace / leading
+                            // blank lines, duplicating content into the proto.
+                            val firstNlIdx = newBody.indexOf('\n')
+                            val createTitle = if (firstNlIdx < 0) newBody else newBody.substring(0, firstNlIdx)
+                            val createBody = if (firstNlIdx < 0) "" else newBody.substring(firstNlIdx + 1)
+                            Log.i(
+                                TAG,
+                                "save (draft→createNote): title='${createTitle.take(30)}' " +
+                                    "body.len=${createBody.length} snippet='${newSnippet.take(30)}'",
+                            )
+                            updated = client.createNote(
+                                title = createTitle,
+                                body = createBody,
+                                folderRef = folderRef,
+                                ourReplicaUuid = uuid,
+                            )
+                            // Pre-pend a fresh summary into the cache so back-nav
+                            // shows the new note immediately without a refetch.
+                            val folderRecordName = com.example.applenotes.client.extractReferenceRecordName(folderRef)
+                            val newSummary = NoteSummary(
+                                recordName = updated.recordName,
+                                title = newTitle,
+                                snippet = newSnippet,
+                                modificationTimestampMs = System.currentTimeMillis(),
+                                deleted = false,
+                                folderRecordName = folderRecordName,
+                            )
+                            patchedCache = listOf(newSummary) + s.notesCache
+                        } else {
+                            // EXISTING NOTE: incremental modify path.
+                            val tag = s.record.recordChangeTag!!
+                            val textB64 = s.record.stringField("TextDataEncrypted")
+                                ?: error("No body field on this note.")
+                            val originalBody = NoteBodyEditor.readVisibleTextFromBase64(textB64)
+                                ?: NoteBodyEditor.readTextFromBase64(textB64).orEmpty()
+                            val now = System.currentTimeMillis() / 1000L
+                            // Pure-append edits go through the cheap APPEND path
+                            // (one new substring at the sentinel slot). Anything
+                            // else (replace/insert/delete in the middle) goes
+                            // through the splice path which mirrors iCloud.com's
+                            // pattern: slot promotion + split-and-tombstone +
+                            // fresh ts on tombstones + new chunks for inserts.
+                            val newB64 = if (isPureAppend) {
+                                val appended = newBody.removePrefix(originalBody)
+                                require(appended.isNotEmpty()) { "Pure-append marked but no new chars" }
+                                NoteAppender.appendBase64(textB64, uuid, appended, now)
+                            } else {
+                                NoteAppender.setBodyBase64(textB64, uuid, newBody, now)
+                            }
+                            val (oldTitle, oldSnippet) = computeTitleAndSnippet(originalBody)
+                            Log.i(
+                                TAG,
+                                "save: title '${oldTitle.take(30)}'->'${newTitle.take(30)}' " +
+                                    "snippet '${oldSnippet.take(30)}'->'${newSnippet.take(30)}'",
+                            )
+                            updated = client.modifyNoteBody(
+                                s.record.recordName,
+                                tag,
+                                newB64,
+                                newTitle = newTitle.takeIf { it != oldTitle },
+                                newSnippet = newSnippet.takeIf { it != oldSnippet },
+                                replicaVersionPassThroughB64 = s.record.stringField("ReplicaIDToNotesVersionDataEncrypted"),
+                            )
+                            // Patch the cached list summary for this note so when
+                            // the user navigates back they see the updated
+                            // snippet/title without a refetch.
+                            patchedCache = s.notesCache.map { note ->
+                                if (note.recordName == s.record.recordName) {
+                                    note.copy(
+                                        title = newTitle,
+                                        snippet = newSnippet,
+                                        modificationTimestampMs = System.currentTimeMillis(),
+                                    )
+                                } else note
+                            }
                         }
                         // Defensive state update: the save coroutine may complete
                         // AFTER the user has navigated away (e.g. they tapped back,
@@ -407,12 +476,21 @@ fun AppleNotesApp() {
                         // Detail, refresh with the updated record. If they've
                         // moved to NotesList, just patch its cache silently. Else
                         // (Error, Splash, Login, different Detail), leave alone.
+                        //
+                        // Match by recordName for both real notes (CloudKit ID)
+                        // and drafts (the local "draft-<uuid>" we minted on FAB
+                        // tap). This disambiguates if the user has multiple
+                        // drafts in flight: each has its own draft ID, the
+                        // save callback closure captured the originating
+                        // draft's ID via `s`, and only the matching Detail
+                        // gets replaced.
                         val current = state
+                        val sameDetail = current is ScreenState.Detail &&
+                            current.record.recordName == s.record.recordName
                         state = when {
-                            current is ScreenState.Detail &&
-                                current.record.recordName == s.record.recordName ->
+                            sameDetail && current is ScreenState.Detail ->
                                 if (alsoExit) ScreenState.NotesList(current.session, patchedCache, current.folders, current.selectedFolder)
-                                else ScreenState.Detail(current.session, updated, patchedCache, current.folders, current.selectedFolder)
+                                else ScreenState.Detail(current.session, updated, patchedCache, current.folders, current.selectedFolder, pendingFolderRef = null)
                             current is ScreenState.NotesList ->
                                 current.copy(notes = patchedCache)
                             else -> current
@@ -428,10 +506,15 @@ fun AppleNotesApp() {
             },
             onDelete = {
                 scope.launch {
+                    // Draft (never saved to iCloud): just discard locally,
+                    // no network call needed.
+                    if (s.record.recordChangeTag == null) {
+                        state = ScreenState.NotesList(s.session, s.notesCache, s.folders, s.selectedFolder)
+                        return@launch
+                    }
                     state = ScreenState.Loading("Deleting…")
                     state = try {
-                        val tag = s.record.recordChangeTag
-                            ?: error("No recordChangeTag — refresh first.")
+                        val tag = s.record.recordChangeTag!!
                         AppleNotesClient(httpClient, s.session).deleteNote(s.record.recordName, tag)
                         // Drop the deleted note from the cache and return to list.
                         ScreenState.NotesList(
