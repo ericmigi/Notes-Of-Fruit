@@ -34,6 +34,21 @@ data class NoteSummary(
     val snippet: String?,
     val modificationTimestampMs: Long?,
     val deleted: Boolean,
+    /**
+     * The recordName of the Folder this note lives in. Apple's special folders:
+     *  - "DefaultFolder-CloudKit"  → the standard "Notes" folder
+     *  - "TrashFolder-CloudKit"    → "Recently Deleted"
+     *  - any other UUID            → user-created folder
+     */
+    val folderRecordName: String?,
+)
+
+/** A folder the user has created (or one of Apple's special folders). */
+data class FolderSummary(
+    val recordName: String,
+    val displayName: String?,
+    val isTrash: Boolean,
+    val isDefault: Boolean,
 )
 
 /** Full record for the note detail view. */
@@ -116,6 +131,7 @@ class AppleNotesClient(
                     modificationTimestampMs = rec.fields?.get("ModificationDate")
                         ?.let(::extractStringValue)?.toLongOrNull(),
                     deleted = rec.fields?.get("Deleted")?.let(::extractStringValue) == "1",
+                    folderRecordName = rec.fields?.get("Folder")?.let(::extractReferenceRecordName),
                 )
             }
             all.addAll(pageResults)
@@ -137,6 +153,61 @@ class AppleNotesClient(
             )
         }
         return all
+    }
+
+    /**
+     * Query all Folder records in the user's Notes zone. We iterate the
+     * "folders" SearchIndex (same paginated pattern as fetchRecents) and
+     * decode each folder's TitleEncrypted as the display name. Apple's two
+     * special folders ("Notes" / DefaultFolder-CloudKit and
+     * "Recently Deleted" / TrashFolder-CloudKit) come back too.
+     */
+    /**
+     * Look up folders by their CloudKit recordNames. CloudKit refuses to
+     * "query" Folder records ("Type is not marked indexable") and there's no
+     * "folders" SearchIndex either ("No index of this name exists"), so we
+     * use /records/lookup with the specific recordNames the caller provides
+     * (typically derived from the `Folder` reference field of every fetched
+     * note). Returns one FolderSummary per requested recordName, with a
+     * decoded display name when present.
+     */
+    suspend fun lookupFolders(recordNames: Collection<String>): List<FolderSummary> {
+        if (recordNames.isEmpty()) return emptyList()
+        val payload: JsonObject = buildJsonObject {
+            put("zoneID", buildJsonObject { put("zoneName", "Notes") })
+            putJsonArray("records") {
+                for (rn in recordNames.distinct()) {
+                    add(buildJsonObject { put("recordName", rn) })
+                }
+            }
+        }
+        Log.i(TAG, "lookupFolders: ${recordNames.size} ids")
+        val (status, raw) = postJson("/records/lookup", payload)
+        if (status !in 200..299) {
+            Log.e(TAG, "lookupFolders FAILED body=${raw.take(800)}")
+            error("CloudKit folder lookup HTTP $status: ${raw.take(800)}")
+        }
+        val parsed = LENIENT_JSON.decodeFromString(QueryResponse.serializer(), raw)
+        val out = (parsed.records ?: emptyList()).mapNotNull { rec ->
+            val rn = rec.recordName ?: return@mapNotNull null
+            // A record can come back with serverErrorCode=NOT_FOUND if the
+            // ref points at a folder we can't see (rare). Skip those.
+            if (rec.serverErrorCode != null) {
+                Log.w(TAG, "lookupFolders: skipping $rn (${rec.serverErrorCode})")
+                return@mapNotNull null
+            }
+            FolderSummary(
+                recordName = rn,
+                displayName = rec.fields?.get("TitleEncrypted")?.let(::decodeEncryptedString),
+                isTrash = rn == "TrashFolder-CloudKit",
+                isDefault = rn == "DefaultFolder-CloudKit",
+            )
+        }
+        Log.i(TAG, "lookupFolders: ${out.size} resolved")
+        for ((i, f) in out.withIndex()) {
+            Log.i(TAG, "  [$i] ${f.recordName} display='${f.displayName}' trash=${f.isTrash} default=${f.isDefault}")
+        }
+        return out
     }
 
     @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
@@ -519,6 +590,17 @@ internal fun extractStringValue(field: JsonElement): String? {
     val obj = field as? JsonObject ?: return null
     val value = obj["value"] ?: return null
     return runCatching { value.jsonPrimitive.content }.getOrNull()
+}
+
+/**
+ * CKReference fields look like
+ *   { "type": "REFERENCE", "value": { "recordName": "...", "action": "NONE", "zoneID": {...} } }
+ * Pull `value.recordName` out.
+ */
+internal fun extractReferenceRecordName(field: JsonElement): String? {
+    val obj = field as? JsonObject ?: return null
+    val value = obj["value"] as? JsonObject ?: return null
+    return runCatching { value["recordName"]?.jsonPrimitive?.content }.getOrNull()
 }
 
 @OptIn(ExperimentalEncodingApi::class)

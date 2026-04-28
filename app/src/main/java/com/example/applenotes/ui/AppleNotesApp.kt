@@ -14,9 +14,11 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
@@ -35,6 +37,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
@@ -43,7 +46,11 @@ import androidx.compose.material.icons.filled.CheckBoxOutlineBlank
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.LargeTopAppBar
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.foundation.layout.size
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -101,6 +108,7 @@ import com.example.applenotes.auth.DeviceIdentity
 import com.example.applenotes.auth.ICloudSession
 import com.example.applenotes.auth.USER_AGENT
 import com.example.applenotes.client.AppleNotesClient
+import com.example.applenotes.client.FolderSummary
 import com.example.applenotes.client.NoteRecord
 import com.example.applenotes.client.NoteSummary
 import com.example.applenotes.proto.NoteAppender
@@ -117,7 +125,17 @@ private sealed interface ScreenState {
     data object Login : ScreenState
     data class Loading(val msg: String) : ScreenState
     data class Error(val msg: String) : ScreenState
-    data class NotesList(val session: ICloudSession, val notes: List<NoteSummary>) : ScreenState
+    data class NotesList(
+        val session: ICloudSession,
+        val notes: List<NoteSummary>,
+        val folders: List<FolderSummary>,
+        /**
+         * Currently-selected folder recordName. Null = "All notes" pseudo-folder
+         * (every note across user-visible folders). Use [TRASH_RECORD_NAME] to
+         * show Recently Deleted explicitly.
+         */
+        val selectedFolder: String? = "DefaultFolder-CloudKit",
+    ) : ScreenState
     /**
      * Detail keeps the cached [notesCache] from the list view so back-nav
      * restores the list instantly without a `fetchRecents` round trip.
@@ -128,8 +146,13 @@ private sealed interface ScreenState {
         val session: ICloudSession,
         val record: NoteRecord,
         val notesCache: List<NoteSummary>,
+        val folders: List<FolderSummary>,
+        val selectedFolder: String?,
     ) : ScreenState
 }
+
+private const val TRASH_RECORD_NAME = "TrashFolder-CloudKit"
+private const val DEFAULT_FOLDER_RECORD_NAME = "DefaultFolder-CloudKit"
 
 @Composable
 fun AppleNotesApp() {
@@ -159,10 +182,23 @@ fun AppleNotesApp() {
 
     suspend fun bootstrap(): ScreenState = try {
         val session = AppleNotesSession(httpClient, cookieReader).bootstrap().getOrThrow()
-        val notes = AppleNotesClient(httpClient, session).fetchRecents(limit = 1000)
+        val client = AppleNotesClient(httpClient, session)
+        val notes = client.fetchRecents(limit = 1000)
             .filter { !it.deleted }
             .sortedByDescending { it.modificationTimestampMs ?: 0L }
-        ScreenState.NotesList(session, notes)
+        val folderIds = notes.mapNotNull { it.folderRecordName }.toSet()
+        val folders = runCatching { client.lookupFolders(folderIds) }.getOrElse {
+            Log.w(TAG, "lookupFolders failed; falling back to ID-only list", it)
+            folderIds.map { rn ->
+                FolderSummary(
+                    recordName = rn,
+                    displayName = null,
+                    isTrash = rn == TRASH_RECORD_NAME,
+                    isDefault = rn == DEFAULT_FOLDER_RECORD_NAME,
+                )
+            }
+        }
+        ScreenState.NotesList(session, notes, folders)
     } catch (e: Throwable) {
         Log.e(TAG, "bootstrap failed", e)
         ScreenState.Error(e.message ?: e.toString())
@@ -210,13 +246,18 @@ fun AppleNotesApp() {
             },
         )
         is ScreenState.NotesList -> NotesListScreen(
-            notes = s.notes,
+            allNotes = s.notes,
+            folders = s.folders,
+            selectedFolder = s.selectedFolder,
+            onSelectFolder = { folderRn ->
+                state = s.copy(selectedFolder = folderRn)
+            },
             onSelect = { note ->
                 scope.launch {
                     state = ScreenState.Loading("Loading note…")
                     state = try {
                         val rec = AppleNotesClient(httpClient, s.session).lookupNote(note.recordName)
-                        ScreenState.Detail(s.session, rec, s.notes)
+                        ScreenState.Detail(s.session, rec, s.notes, s.folders, s.selectedFolder)
                     } catch (e: Throwable) {
                         ScreenState.Error(e.message ?: e.toString())
                     }
@@ -226,7 +267,13 @@ fun AppleNotesApp() {
                 scope.launch {
                     state = ScreenState.Loading("Refreshing…")
                     state = try {
-                        ScreenState.NotesList(s.session, refreshList(s.session))
+                        val client = AppleNotesClient(httpClient, s.session)
+                        val notes = client.fetchRecents(limit = 1000)
+                            .filter { !it.deleted }
+                            .sortedByDescending { it.modificationTimestampMs ?: 0L }
+                        val folderIds = notes.mapNotNull { it.folderRecordName }.toSet()
+                        val folders = runCatching { client.lookupFolders(folderIds) }.getOrElse { s.folders }
+                        ScreenState.NotesList(s.session, notes, folders, s.selectedFolder)
                     } catch (e: Throwable) {
                         ScreenState.Error(e.message ?: e.toString())
                     }
@@ -244,7 +291,12 @@ fun AppleNotesApp() {
                         val client = AppleNotesClient(httpClient, s.session)
                         // Grab a Folder ref from any existing note (CloudKit
                         // requires a CKReference to attach the new note to).
-                        val sample = s.notes.firstOrNull()
+                        // Prefer one from the currently-selected folder so
+                        // the new note lands in the same folder the user is
+                        // viewing.
+                        val sample = s.notes
+                            .firstOrNull { it.folderRecordName == s.selectedFolder }
+                            ?: s.notes.firstOrNull { it.folderRecordName != TRASH_RECORD_NAME }
                             ?: error("No existing note to copy folder reference from")
                         val sampleRecord = client.lookupNote(sample.recordName)
                         val folderRef = sampleRecord.rawFields["Folder"]
@@ -265,8 +317,9 @@ fun AppleNotesApp() {
                             snippet = null,
                             modificationTimestampMs = System.currentTimeMillis(),
                             deleted = false,
+                            folderRecordName = sample.folderRecordName,
                         )
-                        ScreenState.Detail(s.session, created, listOf(newSummary) + s.notes)
+                        ScreenState.Detail(s.session, created, listOf(newSummary) + s.notes, s.folders, s.selectedFolder)
                     } catch (e: Throwable) {
                         Log.e(TAG, "createNote failed", e)
                         ScreenState.Error(e.message ?: e.toString())
@@ -288,7 +341,7 @@ fun AppleNotesApp() {
                 // Restore the cached list instantly. No network round trip —
                 // `notesCache` was patched in place when we saved, so the snippet
                 // for the just-edited note already reflects our changes.
-                state = ScreenState.NotesList(s.session, s.notesCache)
+                state = ScreenState.NotesList(s.session, s.notesCache, s.folders, s.selectedFolder)
             },
             onSave = { newBody, isPureAppend, alsoExit ->
                 scope.launch {
@@ -358,10 +411,10 @@ fun AppleNotesApp() {
                         state = when {
                             current is ScreenState.Detail &&
                                 current.record.recordName == s.record.recordName ->
-                                if (alsoExit) ScreenState.NotesList(current.session, patchedCache)
-                                else ScreenState.Detail(current.session, updated, patchedCache)
+                                if (alsoExit) ScreenState.NotesList(current.session, patchedCache, current.folders, current.selectedFolder)
+                                else ScreenState.Detail(current.session, updated, patchedCache, current.folders, current.selectedFolder)
                             current is ScreenState.NotesList ->
-                                ScreenState.NotesList(current.session, patchedCache)
+                                current.copy(notes = patchedCache)
                             else -> current
                         }
                         lastSavedAtMs = System.currentTimeMillis()
@@ -384,6 +437,8 @@ fun AppleNotesApp() {
                         ScreenState.NotesList(
                             s.session,
                             s.notesCache.filter { it.recordName != s.record.recordName },
+                            s.folders,
+                            s.selectedFolder,
                         )
                     } catch (e: Throwable) {
                         Log.e(TAG, "delete failed", e)
@@ -465,30 +520,77 @@ private fun LoginScreen(onCookiesArrived: () -> Unit) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun NotesListScreen(
-    notes: List<NoteSummary>,
+    allNotes: List<NoteSummary>,
+    folders: List<FolderSummary>,
+    selectedFolder: String?,
+    onSelectFolder: (String?) -> Unit,
     onSelect: (NoteSummary) -> Unit,
     onRefresh: () -> Unit,
     onCreateNote: () -> Unit,
     onSignOut: () -> Unit,
 ) {
     var query by remember { mutableStateOf("") }
-    val filtered = remember(notes, query) {
-        if (query.isBlank()) notes
-        else notes.filter {
+    // Notes filtered to the currently-selected folder. null = "All notes"
+    // (every folder except trash). TRASH_RECORD_NAME = trash only.
+    val notesInFolder = remember(allNotes, selectedFolder) {
+        when (selectedFolder) {
+            null -> allNotes.filter { it.folderRecordName != TRASH_RECORD_NAME }
+            else -> allNotes.filter { it.folderRecordName == selectedFolder }
+        }
+    }
+    val filtered = remember(notesInFolder, query) {
+        if (query.isBlank()) notesInFolder
+        else notesInFolder.filter {
             (it.title?.contains(query, ignoreCase = true) == true) ||
                 (it.snippet?.contains(query, ignoreCase = true) == true)
         }
     }
+    val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
+    val drawerScope = rememberCoroutineScope()
+    val selectedFolderName = remember(selectedFolder, folders) {
+        when (selectedFolder) {
+            null -> "All notes"
+            TRASH_RECORD_NAME -> "Recently Deleted"
+            DEFAULT_FOLDER_RECORD_NAME -> folders.firstOrNull { it.recordName == DEFAULT_FOLDER_RECORD_NAME }
+                ?.displayName ?: "Notes"
+            else -> folders.firstOrNull { it.recordName == selectedFolder }?.displayName ?: "Folder"
+        }
+    }
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            FoldersDrawer(
+                folders = folders,
+                allNotes = allNotes,
+                selectedFolder = selectedFolder,
+                onSelect = { rn ->
+                    onSelectFolder(rn)
+                    drawerScope.launch { drawerState.close() }
+                },
+                onSignOut = {
+                    drawerScope.launch { drawerState.close() }
+                    onSignOut()
+                },
+            )
+        },
+    ) {
     Scaffold(
         modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
         topBar = {
             LargeTopAppBar(
+                navigationIcon = {
+                    IconButton(onClick = {
+                        drawerScope.launch { drawerState.open() }
+                    }) {
+                        Icon(Icons.Default.Menu, contentDescription = "Folders")
+                    }
+                },
                 title = {
                     Column {
-                        Text("Notes", style = MaterialTheme.typography.displayLarge)
+                        Text(selectedFolderName, style = MaterialTheme.typography.displayLarge)
                         Text(
-                            "${notes.size} note${if (notes.size == 1) "" else "s"}",
+                            "${notesInFolder.size} note${if (notesInFolder.size == 1) "" else "s"}",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -497,9 +599,6 @@ private fun NotesListScreen(
                 actions = {
                     IconButton(onClick = onRefresh) {
                         Icon(Icons.Default.Refresh, contentDescription = "Refresh")
-                    }
-                    IconButton(onClick = onSignOut) {
-                        Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = "Sign out")
                     }
                 },
                 scrollBehavior = scrollBehavior,
@@ -553,6 +652,127 @@ private fun NotesListScreen(
                     item { Spacer(Modifier.height(80.dp)) } // FAB clearance
                 }
             }
+        }
+    }
+    }  // ModalNavigationDrawer
+}
+
+@Composable
+private fun FoldersDrawer(
+    folders: List<FolderSummary>,
+    allNotes: List<NoteSummary>,
+    selectedFolder: String?,
+    onSelect: (String?) -> Unit,
+    onSignOut: () -> Unit,
+) {
+    // Per-folder note counts (excluding deleted=true outliers, which we
+    // already filter at fetch time).
+    val countByFolder = remember(allNotes) {
+        allNotes.groupingBy { it.folderRecordName }.eachCount()
+    }
+    val nonTrashCount = remember(allNotes) {
+        allNotes.count { it.folderRecordName != TRASH_RECORD_NAME }
+    }
+    ModalDrawerSheet {
+        Column(
+            modifier = Modifier
+                .fillMaxHeight()
+                .verticalScroll(rememberScrollState()),
+        ) {
+            Text(
+                "Notes of Fruit",
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(start = 24.dp, top = 24.dp, bottom = 8.dp),
+            )
+            // "All notes" pseudo-folder
+            DrawerFolderRow(
+                label = "All notes",
+                count = nonTrashCount,
+                selected = selectedFolder == null,
+                onClick = { onSelect(null) },
+            )
+            // User-visible folders (not trash)
+            for (folder in folders.filter { !it.isTrash }) {
+                val display = folder.displayName ?: when {
+                    folder.isDefault -> "Notes"
+                    else -> folder.recordName.take(8)
+                }
+                DrawerFolderRow(
+                    label = display,
+                    count = countByFolder[folder.recordName] ?: 0,
+                    selected = selectedFolder == folder.recordName,
+                    onClick = { onSelect(folder.recordName) },
+                )
+            }
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+            DrawerFolderRow(
+                label = "Recently Deleted",
+                count = countByFolder[TRASH_RECORD_NAME] ?: 0,
+                selected = selectedFolder == TRASH_RECORD_NAME,
+                onClick = { onSelect(TRASH_RECORD_NAME) },
+                icon = Icons.Default.Delete,
+            )
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onSignOut)
+                    .padding(horizontal = 24.dp, vertical = 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Filled.Logout,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.width(16.dp))
+                Text(
+                    "Sign out",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun DrawerFolderRow(
+    label: String,
+    count: Int,
+    selected: Boolean,
+    onClick: () -> Unit,
+    icon: androidx.compose.ui.graphics.vector.ImageVector? = null,
+) {
+    val bg = if (selected) MaterialTheme.colorScheme.primaryContainer else androidx.compose.ui.graphics.Color.Transparent
+    val fg = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 2.dp)
+            .background(bg, MaterialTheme.shapes.medium)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (icon != null) {
+            Icon(icon, contentDescription = null, tint = fg)
+            Spacer(Modifier.width(12.dp))
+        }
+        Text(
+            label,
+            style = MaterialTheme.typography.bodyLarge,
+            color = fg,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            modifier = Modifier.weight(1f),
+        )
+        if (count > 0) {
+            Text(
+                count.toString(),
+                style = MaterialTheme.typography.labelLarge,
+                color = if (selected) fg else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
@@ -701,44 +921,46 @@ private fun NoteDetailScreen(
                 ?: runCatching { NoteBodyEditor.readTextFromBase64(b64) }.getOrNull()
         }.orEmpty()
     }
-    // Apple Notes stores the title as the first line of the body. The Mac and
-    // iCloud.com renderers display it once (in the title position). Our UI
-    // shows it in the top app bar — so strip the title line + its trailing
-    // newline from the body editor to avoid showing it twice. The original
-    // titlePrefix is stitched back on when we save, so the underlying body
-    // shape stays identical to what Mac expects.
-    val titlePrefix = remember(originalBody) {
+    // Apple Notes stores the title as the first line of the body. We split the
+    // raw originalBody into two editable pieces:
+    //   - `titleDraft`  → rendered as a TextField inside the top app bar
+    //   - `bodyDraft`   → rendered as the main BasicTextField below
+    // On save we re-assemble `titleDraft + "\n" + bodyDraft` (omitting the
+    // separator if either piece is empty) so the underlying CloudKit body
+    // shape stays identical to what Mac expects (first line == title).
+    val initialTitle = remember(originalBody) {
         val firstNl = originalBody.indexOf('\n')
-        when {
-            originalBody.isEmpty() -> ""
-            firstNl < 0 -> originalBody // whole body is one line — treat as title
-            else -> originalBody.substring(0, firstNl + 1)
-        }
+        if (firstNl < 0) originalBody else originalBody.substring(0, firstNl)
     }
-    val titleForBar = titlePrefix.trimEnd('\n').takeIf { it.isNotBlank() } ?: "(untitled)"
-    val originalBodyAfterTitle = originalBody.removePrefix(titlePrefix)
+    val initialBody = remember(originalBody) {
+        val firstNl = originalBody.indexOf('\n')
+        if (firstNl < 0) "" else originalBody.substring(firstNl + 1)
+    }
+    var titleDraft by remember(record.recordName, record.recordChangeTag) {
+        mutableStateOf(initialTitle)
+    }
     var bodyDraft by remember(record.recordName, record.recordChangeTag) {
-        mutableStateOf(originalBodyAfterTitle)
+        mutableStateOf(initialBody)
     }
-    val isModified = bodyDraft != originalBodyAfterTitle
-    val isPureAppend = remember(bodyDraft, originalBodyAfterTitle) {
-        bodyDraft.startsWith(originalBodyAfterTitle) &&
-            bodyDraft.length > originalBodyAfterTitle.length
+    val fullBodyForSave = when {
+        titleDraft.isEmpty() && bodyDraft.isEmpty() -> ""
+        titleDraft.isEmpty() -> bodyDraft
+        bodyDraft.isEmpty() -> titleDraft
+        else -> "$titleDraft\n$bodyDraft"
     }
-    val fullBodyForSave = titlePrefix + bodyDraft
+    val isModified = fullBodyForSave != originalBody
+    val isPureAppend = remember(fullBodyForSave, originalBody) {
+        fullBodyForSave.startsWith(originalBody) && fullBodyForSave.length > originalBody.length
+    }
 
-    // Parse the note's attribute_runs once per record load. These define which
-    // visible chars belong to which paragraph style (bullet/checkbox/numbered/
-    // body). When the user edits, new chars get default body style; existing
-    // formatting is preserved unchanged in the proto (we don't yet emit new
-    // attribute_runs from edits — that's Phase D / editor toolbar).
+    // Parse the note's attribute_runs once per record load — kept around so
+    // the splice path in NoteAppender can preserve paragraph styles through
+    // edits (Phase D1). Display-time formatting via VisualTransformation is
+    // a future enhancement; for now the editor shows plain text.
     val attrSpans = remember(record.recordName, record.recordChangeTag) {
         record.stringField("TextDataEncrypted")?.let { b64 ->
             runCatching { NoteBodyEditor.parseAttributeRunsFromBase64(b64) }.getOrNull()
         }.orEmpty()
-    }
-    var editing by remember(record.recordName, record.recordChangeTag) {
-        mutableStateOf(false)
     }
 
     var showDeleteDialog by remember { mutableStateOf(false) }
@@ -801,7 +1023,31 @@ private fun NoteDetailScreen(
                     },
                     title = {
                         Column {
-                            Text(titleForBar, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            // Editable title in the app bar — tap to type.
+                            BasicTextField(
+                                value = titleDraft,
+                                onValueChange = { titleDraft = it.replace("\n", "") },
+                                singleLine = true,
+                                textStyle = MaterialTheme.typography.titleLarge.copy(
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    fontWeight = FontWeight.Bold,
+                                ),
+                                cursorBrush = androidx.compose.ui.graphics.SolidColor(MaterialTheme.colorScheme.primary),
+                                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                                decorationBox = { inner ->
+                                    if (titleDraft.isEmpty()) {
+                                        Text(
+                                            "Untitled",
+                                            style = MaterialTheme.typography.titleLarge.copy(
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                fontWeight = FontWeight.Bold,
+                                            ),
+                                        )
+                                    }
+                                    inner()
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
                             val pill = when {
                                 saving -> "Saving…"
                                 isModified -> "Unsaved"
@@ -827,11 +1073,6 @@ private fun NoteDetailScreen(
                                 Icon(Icons.Default.Check, contentDescription = "Save")
                             }
                         }
-                        if (!editing) {
-                            IconButton(onClick = { editing = true }) {
-                                Icon(Icons.Default.Edit, contentDescription = "Edit")
-                            }
-                        }
                         IconButton(
                             onClick = {
                                 // Share the visible body (title + content) as
@@ -839,7 +1080,7 @@ private fun NoteDetailScreen(
                                 val sendIntent = Intent(Intent.ACTION_SEND).apply {
                                     type = "text/plain"
                                     putExtra(Intent.EXTRA_TEXT, fullBodyForSave)
-                                    titleForBar.takeIf { it != "(untitled)" }?.let {
+                                    titleDraft.takeIf { it.isNotBlank() }?.let {
                                         putExtra(Intent.EXTRA_SUBJECT, it)
                                     }
                                 }
@@ -872,42 +1113,34 @@ private fun NoteDetailScreen(
         Column(
             modifier = Modifier.fillMaxSize().padding(padding),
         ) {
-            if (editing) {
-                BasicTextField(
-                    value = bodyDraft,
-                    onValueChange = { bodyDraft = it },
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                        .padding(horizontal = 20.dp, vertical = 16.dp),
-                    textStyle = MaterialTheme.typography.bodyLarge.copy(
-                        color = MaterialTheme.colorScheme.onSurface,
-                    ),
-                    cursorBrush = androidx.compose.ui.graphics.SolidColor(MaterialTheme.colorScheme.primary),
-                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
-                    decorationBox = { inner ->
-                        if (bodyDraft.isEmpty()) {
-                            Text(
-                                "Start typing…",
-                                style = MaterialTheme.typography.bodyLarge.copy(
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                ),
-                            )
-                        }
-                        inner()
-                    },
-                )
-            } else {
-                FormattedNoteBody(
-                    fullBody = fullBodyForSave,
-                    titlePrefixLength = titlePrefix.length,
-                    attrSpans = attrSpans,
-                    onTap = { editing = true },
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth(),
-                )
-            }
+            // Single unified editor — no edit/view mode toggle. The user can
+            // read or write at any time; the body is always editable. Title
+            // lives in the app bar (editable there) so it's never duplicated
+            // here.
+            BasicTextField(
+                value = bodyDraft,
+                onValueChange = { bodyDraft = it },
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 16.dp),
+                textStyle = MaterialTheme.typography.bodyLarge.copy(
+                    color = MaterialTheme.colorScheme.onSurface,
+                ),
+                cursorBrush = androidx.compose.ui.graphics.SolidColor(MaterialTheme.colorScheme.primary),
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                decorationBox = { inner ->
+                    if (bodyDraft.isEmpty()) {
+                        Text(
+                            "Start typing…",
+                            style = MaterialTheme.typography.bodyLarge.copy(
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            ),
+                        )
+                    }
+                    inner()
+                },
+            )
             // Footer: modification date + char count + chord guidance.
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             Row(
