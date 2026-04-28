@@ -159,7 +159,7 @@ class DebugReceiver : BroadcastReceiver() {
                 launchOp("CREATE") { client, _ ->
                     val uuid = DeviceIdentity.getOrCreate(context)
                     // Find a folder reference from any existing note.
-                    val anyNote = client.fetchRecents(1).firstOrNull()
+                    val anyNote = client.fetchRecents(50).firstOrNull()
                         ?: error("no existing notes to copy folder reference from")
                     val sample = client.lookupNote(anyNote.recordName)
                     val folderRef = sample.rawFields["Folder"]
