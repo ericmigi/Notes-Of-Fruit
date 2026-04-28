@@ -249,6 +249,133 @@ object NoteBodyEditor {
     }
 
     /**
+     * Walk the topotext.String substring tree and return the VISIBLE text — i.e.
+     * what Mac/iCloud renders. This differs from [readText] (which returns
+     * `String.string`, the bag-of-bytes in insertion order, INCLUDING bytes that
+     * sit under tombstoned substrings).
+     *
+     * Apple's invariants we lean on:
+     *  - Substring at array index 0 is the doc-start (charID=(0,0), length=0).
+     *  - The sentinel (charID=(0,0xFFFFFFFF)) is the LAST substring.
+     *  - Each substring's `child[0]` (when present) is the next-in-document
+     *    substring index — chained from doc-start to sentinel.
+     *  - `String.string` holds chars in array-INSERTION order: the k-th
+     *    non-zero-length substring's chars start at the cumulative sum of all
+     *    earlier non-zero-length substrings' `length`s.
+     *
+     * Returns null if the proto isn't shaped like NoteStoreProto/topotext.
+     */
+    fun readVisibleText(noteStoreProtoBytes: ByteArray): String? = runCatching {
+        val top = ProtobufWire.decode(noteStoreProtoBytes)
+        val docField = top.firstOrNull {
+            it.fieldNumber == FIELD_NOTESTOREPROTO_DOCUMENT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        } ?: return@runCatching null
+        val docFields = ProtobufWire.decode(docField.payload)
+        val noteField = docFields.firstOrNull {
+            it.fieldNumber == FIELD_DOCUMENT_NOTE && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        } ?: return@runCatching null
+        val noteFields = ProtobufWire.decode(noteField.payload)
+
+        val flatBytes = noteFields.firstOrNull {
+            it.fieldNumber == FIELD_NOTE_TEXT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }?.payload ?: return@runCatching null
+        val flat = flatBytes.decodeToString()
+
+        // Parse substrings (field 3) of the Note message: charID, length, tombstone, children.
+        // Field numbers are the topotext.String / Substring schema (see NoteAppender).
+        val FIELD_SUBSTRING = 3
+        val FIELD_SUB_CHARID = 1
+        val FIELD_SUB_LENGTH = 2
+        val FIELD_SUB_TOMBSTONE = 4
+        val FIELD_SUB_CHILD = 5
+        val FIELD_CHARID_REPLICA = 1
+        val FIELD_CHARID_CLOCK = 2
+        val SENTINEL_CLOCK = 0xFFFFFFFFL
+
+        data class S(
+            val arrayIdx: Int,
+            val replica: Long,
+            val clock: Long,
+            val length: Int,
+            val tombstone: Boolean,
+            val children: List<Int>,
+        )
+
+        val subs = mutableListOf<S>()
+        var arrayIdx = 0
+        for (f in noteFields) {
+            if (f.fieldNumber != FIELD_SUBSTRING || f.wireType != ProtobufWire.WIRE_LENGTH_DELIM) continue
+            val sub = ProtobufWire.decode(f.payload)
+            val charID = sub.firstOrNull {
+                it.fieldNumber == FIELD_SUB_CHARID && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }?.let { ProtobufWire.decode(it.payload) }
+            val replica = charID?.firstOrNull {
+                it.fieldNumber == FIELD_CHARID_REPLICA && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+            val clock = charID?.firstOrNull {
+                it.fieldNumber == FIELD_CHARID_CLOCK && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+            val length = sub.firstOrNull {
+                it.fieldNumber == FIELD_SUB_LENGTH && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it).toInt() } ?: 0
+            val tombstone = sub.firstOrNull {
+                it.fieldNumber == FIELD_SUB_TOMBSTONE && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) != 0L } ?: false
+            val children = sub.filter {
+                it.fieldNumber == FIELD_SUB_CHILD && it.wireType == ProtobufWire.WIRE_VARINT
+            }.map { ProtobufWire.decodeVarint(it).toInt() }
+            subs.add(S(arrayIdx, replica, clock, length, tombstone, children))
+            arrayIdx++
+        }
+        if (subs.isEmpty()) return@runCatching null
+
+        // Compute each substring's offset into `flat` (array-insertion order).
+        // Apple stores `String.string` as the LIVE chars only — tombstoned
+        // substrings retain their `length` field (it describes the CharID range
+        // they consumed) but contribute zero bytes to `String.string`. So when
+        // accumulating offsets we skip tombstoned substrings. Doc-start and
+        // sentinel have length 0 already.
+        val offsets = IntArray(subs.size)
+        var off = 0
+        for (s in subs) {
+            offsets[s.arrayIdx] = off
+            if (!s.tombstone) off += s.length
+        }
+
+        // Walk via child[0] from doc-start (idx 0) to the sentinel.
+        // Output non-tombstoned, non-sentinel substrings' chars from `flat`.
+        val out = StringBuilder()
+        var cur = 0
+        val visited = BooleanArray(subs.size)
+        var safety = subs.size + 1
+        while (cur in subs.indices && !visited[cur] && safety-- > 0) {
+            visited[cur] = true
+            val s = subs[cur]
+            val isSentinel = s.replica == 0L && s.clock == SENTINEL_CLOCK
+            if (!isSentinel && !s.tombstone && s.length > 0) {
+                val start = offsets[s.arrayIdx]
+                val end = (start + s.length).coerceAtMost(flat.length)
+                if (start in 0..flat.length) out.append(flat, start, end)
+            }
+            cur = s.children.firstOrNull() ?: break
+        }
+        // Apple Notes stores Shift-Enter / soft line breaks as U+2028 (LINE
+        // SEPARATOR) and paragraph separators as U+2029 — same byte sequence
+        // Mac and iCloud render as a line break. Android's default fonts lack
+        // glyphs for these so they render as `□` placeholder boxes. Translate
+        // them to `\n` so the UI shows clean line breaks; this also makes
+        // pure-append diffing work normally for users who add lines below.
+        out.toString()
+            .replace(' ', '\n')
+            .replace(' ', '\n')
+    }.getOrNull()
+
+    fun readVisibleTextFromBase64(textDataEncryptedB64: String): String? {
+        val compressed = Base64.decode(textDataEncryptedB64)
+        return readVisibleText(Gzip.decompress(compressed))
+    }
+
+    /**
      * One-line structural summary of the proto bytes for diagnostic logging.
      * Goal: see at a glance whether ops/replicas/attribute_runs look sane and
      * whether the editing replica index we forge matches the replica registry.
@@ -449,6 +576,88 @@ object NoteBodyEditor {
         }
         sb.toString()
     }.getOrElse { "dump_attrs_failed: ${it.message}" }
+
+    /**
+     * One line per substring with its array idx, charID, length, tombstone, and
+     * children. Lets us spot CRDT corruption like: more than one substring's
+     * `child[0]` pointing at the sentinel (a "fork" => Mac visible-text walk
+     * visits the doc twice).
+     */
+    fun dumpSubstringTreeBase64(textDataEncryptedB64: String): String = runCatching {
+        val proto = Gzip.decompress(Base64.decode(textDataEncryptedB64))
+        val top = ProtobufWire.decode(proto)
+        val docField = top.firstOrNull {
+            it.fieldNumber == FIELD_NOTESTOREPROTO_DOCUMENT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        } ?: return@runCatching "no document"
+        val docFields = ProtobufWire.decode(docField.payload)
+        val noteField = docFields.firstOrNull {
+            it.fieldNumber == FIELD_DOCUMENT_NOTE && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        } ?: return@runCatching "no note"
+        val noteFields = ProtobufWire.decode(noteField.payload)
+        val FIELD_SUBSTRING = 3
+        val FIELD_SUB_CHARID = 1
+        val FIELD_SUB_LENGTH = 2
+        val FIELD_SUB_TIMESTAMP = 3
+        val FIELD_SUB_TOMBSTONE = 4
+        val FIELD_SUB_CHILD = 5
+        val FIELD_CHARID_REPLICA = 1
+        val FIELD_CHARID_CLOCK = 2
+        val sb = StringBuilder()
+        var idx = 0
+        val parentsOfSentinel = mutableListOf<Int>()
+        var sentinelIdx = -1
+        for (f in noteFields) {
+            if (f.fieldNumber != FIELD_SUBSTRING || f.wireType != ProtobufWire.WIRE_LENGTH_DELIM) continue
+            val sub = ProtobufWire.decode(f.payload)
+            val charID = sub.firstOrNull {
+                it.fieldNumber == FIELD_SUB_CHARID && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }?.let { ProtobufWire.decode(it.payload) }
+            val replica = charID?.firstOrNull {
+                it.fieldNumber == FIELD_CHARID_REPLICA && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+            val clock = charID?.firstOrNull {
+                it.fieldNumber == FIELD_CHARID_CLOCK && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+            val length = sub.firstOrNull {
+                it.fieldNumber == FIELD_SUB_LENGTH && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+            val tomb = sub.firstOrNull {
+                it.fieldNumber == FIELD_SUB_TOMBSTONE && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) != 0L } ?: false
+            val children = sub.filter {
+                it.fieldNumber == FIELD_SUB_CHILD && it.wireType == ProtobufWire.WIRE_VARINT
+            }.map { ProtobufWire.decodeVarint(it).toInt() }
+            // Style timestamp (CharID nested struct).
+            val ts = sub.firstOrNull {
+                it.fieldNumber == FIELD_SUB_TIMESTAMP && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }?.let { ProtobufWire.decode(it.payload) }
+            val tsRep = ts?.firstOrNull {
+                it.fieldNumber == FIELD_CHARID_REPLICA && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+            val tsClk = ts?.firstOrNull {
+                it.fieldNumber == FIELD_CHARID_CLOCK && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L
+            if (replica == 0L && clock == 0xFFFFFFFFL) sentinelIdx = idx
+            sb.append("[$idx] charID=($replica,$clock) len=$length tomb=$tomb ts=($tsRep,$tsClk) children=$children\n")
+            idx++
+        }
+        if (sentinelIdx >= 0) {
+            // Find every substring that points at the sentinel (its "parent" in the tree).
+            idx = 0
+            for (f in noteFields) {
+                if (f.fieldNumber != FIELD_SUBSTRING || f.wireType != ProtobufWire.WIRE_LENGTH_DELIM) continue
+                val sub = ProtobufWire.decode(f.payload)
+                val children = sub.filter {
+                    it.fieldNumber == FIELD_SUB_CHILD && it.wireType == ProtobufWire.WIRE_VARINT
+                }.map { ProtobufWire.decodeVarint(it).toInt() }
+                if (children.contains(sentinelIdx)) parentsOfSentinel.add(idx)
+                idx++
+            }
+            sb.append("=> sentinel at idx $sentinelIdx; parents=$parentsOfSentinel")
+            if (parentsOfSentinel.size > 1) sb.append(" *** FORK: ${parentsOfSentinel.size} chains lead to sentinel ***")
+        }
+        sb.toString()
+    }.getOrElse { "dump failed: ${it.message}" }
 
     fun dumpReplicasBase64(textDataEncryptedB64: String): String = runCatching {
         val proto = Gzip.decompress(Base64.decode(textDataEncryptedB64))

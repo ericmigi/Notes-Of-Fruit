@@ -281,45 +281,132 @@ object NoteAppender {
             else it.timestampClock
         } ?: 0L
 
+        // ===== Promote ourselves to replica slot 1 =====
+        // iCloud.com's writes always land us at slot 1, demoting every other
+        // replica by one. Mac's notesync uses the slot rotation as the cache-
+        // invalidation signal — without it Mac merges our delta on top of stale
+        // local content and duplicates the body. We rebuild VectorTimestamp's
+        // Clock list (us at front) and rewrite every existing substring's
+        // CharID.replicaID and timestamp.replicaID through the slot remap.
+        // Verified by capturing iCloud.com's resulting proto on a typed note.
+
+        // Build remap: oldSlot -> newSlot.
+        val oldOurSlot = ourClock?.replicaID
+        val replicaRemap = HashMap<Int, Int>()
+        if (oldOurSlot != null) {
+            for (c in clocks) {
+                replicaRemap[c.replicaID] = when {
+                    c.replicaID == oldOurSlot -> 1
+                    c.replicaID < oldOurSlot -> c.replicaID + 1
+                    else -> c.replicaID
+                }
+            }
+        } else {
+            for (c in clocks) replicaRemap[c.replicaID] = c.replicaID + 1
+        }
+
+        // Save each existing Clock entry's bytes by NEW slot so we can rebuild
+        // vtFields in slot order.
+        val savedByNewSlot = HashMap<Int, ProtobufWire.Field>()
+        for (c in clocks) savedByNewSlot[replicaRemap[c.replicaID]!!] = vtFields[c.vtFieldIdx]
+
+        // Strip every Clock entry from vtFields (preserve any non-Clock fields,
+        // which Apple may add in future).
+        vtFields.removeAll {
+            it.fieldNumber == FIELD_VT_CLOCK && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+
+        // Decide our new clocks. We always end up at slot 1.
+        ourReplicaID = 1
+        // First-allocation clock = max-doc-clock + 1 (matches iCloud.com).
+        val freshClockStart = maxOf(maxDocCharIDClock + 1, 0L)
         if (ourClock != null) {
             require(ourClock.replicaClocks.size == 2) {
-                "Our existing Clock has ${ourClock.replicaClocks.size} ReplicaClock " +
-                    "entries; expected 2"
+                "Our existing Clock has ${ourClock.replicaClocks.size} ReplicaClock entries; expected 2"
             }
-            ourReplicaID = ourClock.replicaID
-            // Subsequent edits: pick up where we left off, but never below the
-            // doc's current Lamport (other replicas may have edited since).
-            ourCharIDClock = maxOf(ourClock.replicaClocks[0].clock, maxDocCharIDClock)
+            ourCharIDClock = maxOf(ourClock.replicaClocks[0].clock, freshClockStart)
             ourTimestampClock = ourClock.replicaClocks[1].clock
-            ourClockListIdx = ourClock.vtFieldIdx
             isFirstEdit = false
-            Log.i(
-                TAG,
-                "MATCHED our replica: rid=$ourReplicaID resumeCharIDClock=$ourCharIDClock " +
-                    "ourTimestampClock=$ourTimestampClock " +
-                    "(maxDocCharID=$maxDocCharIDClock maxDocTimestamp=$maxDocTimestampClock)",
-            )
         } else {
-            ourReplicaID = clocks.size + 1
-            // First edit by this replica. Initial charID clock = the doc's
-            // current max charID clock — same Lamport position as the existing
-            // last char. Tie broken by our (higher) replicaID. iCloud.com does
-            // exactly this when it registers a new web-session replica.
-            ourCharIDClock = maxOf(maxDocCharIDClock, 0L)
+            ourCharIDClock = freshClockStart
             ourTimestampClock = 0L
-            ourClockListIdx = vtFields.size
             isFirstEdit = true
-            // Append a fresh Clock entry. counter1 starts at the Lamport position
-            // we just computed; counter2 inherits the doc's max-timestamp-clock
-            // (no bump). Both are bumped below as part of the edit.
+        }
+
+        // Add Clock entries back in new-slot order. Slot 1 = ours; we replace
+        // its bytes below with the bumped counter1/counter2 anyway, but use the
+        // existing entry's bytes if present so subclock + unknown fields survive.
+        ourClockListIdx = vtFields.size
+        if (ourClock != null) {
+            vtFields.add(savedByNewSlot[1]!!) // existing bytes; counters get rewritten below
+        } else {
             vtFields.add(buildClockEntry(ourReplicaUuid, ourCharIDClock, maxDocTimestampClock))
-            Log.i(
-                TAG,
-                "REGISTERED our replica: rid=$ourReplicaID uuid=${hex(ourReplicaUuid)} " +
-                    "initCharIDClock=$ourCharIDClock initTimestampClock=$maxDocTimestampClock " +
-                    "(coexists with ${clocks.size} existing replicas, " +
-                    "maxDocCharID=$maxDocCharIDClock maxDocTimestamp=$maxDocTimestampClock)",
-            )
+        }
+        // Then add slots 2..N in order. Skip slot 1 (just added).
+        val totalSlots = clocks.size + (if (ourClock == null) 1 else 0)
+        for (newSlot in 2..totalSlots) {
+            savedByNewSlot[newSlot]?.let { vtFields.add(it) }
+        }
+        Log.i(
+            TAG,
+            "promoted ourselves to slot 1: oldSlot=$oldOurSlot remap=$replicaRemap " +
+                "ourCharIDClock=$ourCharIDClock ourTimestampClock=$ourTimestampClock " +
+                "(maxDocCharID=$maxDocCharIDClock maxDocTimestamp=$maxDocTimestampClock isFirstEdit=$isFirstEdit)",
+        )
+
+        // ----- Rewrite ALL existing substrings' replicaIDs via remap -----
+        // Doc-start (charID=(0,0)) and sentinel (charID=(0,FFFF...)) have
+        // replicaID=0 — leave them alone.
+        for (subEntry in substrings) {
+            val sentinel = subEntry.charIDReplicaID == SENTINEL_REPLICA_ID && subEntry.charIDClock == SENTINEL_CLOCK
+            if (sentinel) continue
+            if (subEntry.arrayIdx == 0) continue // doc-start
+            val noteIdx = subEntry.noteFieldIdx
+            val subFields = ProtobufWire.decode(stringFields[noteIdx].payload).toMutableList()
+            var subChanged = false
+            // CharID
+            val charIdx = subFields.indexOfFirst {
+                it.fieldNumber == FIELD_SUBSTRING_CHARID && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }
+            if (charIdx >= 0) {
+                val newRid = replicaRemap[subEntry.charIDReplicaID.toInt()]
+                if (newRid != null && newRid != subEntry.charIDReplicaID.toInt()) {
+                    val cf = ProtobufWire.decode(subFields[charIdx].payload).toMutableList()
+                    val ridIdx = cf.indexOfFirst {
+                        it.fieldNumber == FIELD_CHARID_REPLICA_ID && it.wireType == ProtobufWire.WIRE_VARINT
+                    }
+                    if (ridIdx >= 0) {
+                        cf[ridIdx] = ProtobufWire.encodeVarintField(FIELD_CHARID_REPLICA_ID, newRid.toLong())
+                    } else {
+                        cf.add(0, ProtobufWire.encodeVarintField(FIELD_CHARID_REPLICA_ID, newRid.toLong()))
+                    }
+                    subFields[charIdx] = subFields[charIdx].copy(payload = ProtobufWire.encode(cf))
+                    subChanged = true
+                }
+            }
+            // Timestamp CharID
+            val tsIdx = subFields.indexOfFirst {
+                it.fieldNumber == FIELD_SUBSTRING_TIMESTAMP && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }
+            if (tsIdx >= 0) {
+                val newRid = replicaRemap[subEntry.timestampReplicaID.toInt()]
+                if (newRid != null && newRid != subEntry.timestampReplicaID.toInt()) {
+                    val tf = ProtobufWire.decode(subFields[tsIdx].payload).toMutableList()
+                    val ridIdx = tf.indexOfFirst {
+                        it.fieldNumber == FIELD_CHARID_REPLICA_ID && it.wireType == ProtobufWire.WIRE_VARINT
+                    }
+                    if (ridIdx >= 0) {
+                        tf[ridIdx] = ProtobufWire.encodeVarintField(FIELD_CHARID_REPLICA_ID, newRid.toLong())
+                    } else {
+                        tf.add(0, ProtobufWire.encodeVarintField(FIELD_CHARID_REPLICA_ID, newRid.toLong()))
+                    }
+                    subFields[tsIdx] = subFields[tsIdx].copy(payload = ProtobufWire.encode(tf))
+                    subChanged = true
+                }
+            }
+            if (subChanged) {
+                stringFields[noteIdx] = stringFields[noteIdx].copy(payload = ProtobufWire.encode(subFields))
+            }
         }
 
         // ----- Build our new Substring -----
@@ -377,29 +464,10 @@ object NoteAppender {
                 newTimestampClock,
             )
         }
-        // Lamport advance for OTHER replicas. When our edit pushes the doc-wide
-        // CharID Lamport clock past where any existing replica's counter1 was
-        // sitting, those replicas should see their counter1 bumped (= "I've now
-        // observed up to this clock"). Mac may use a vector-clock validity
-        // check that requires ALL replicas' counter1 >= doc-Lamport.
-        for (clockEntry in clocks) {
-            if (clockEntry.uuid.contentEquals(ourReplicaUuid)) continue
-            if (clockEntry.replicaClocks.size < 2) continue
-            val theirCharIDClock = clockEntry.replicaClocks[0].clock
-            val theirTimestampClock = clockEntry.replicaClocks[1].clock
-            if (theirCharIDClock < newCharIDClock) {
-                Log.i(
-                    TAG,
-                    "advancing replica#${clockEntry.replicaID} counter1 " +
-                        "$theirCharIDClock -> $newCharIDClock (Lamport)",
-                )
-                vtFields[clockEntry.vtFieldIdx] = updateExistingClockInPlace(
-                    vtFields[clockEntry.vtFieldIdx],
-                    newCharIDClock,
-                    theirTimestampClock,
-                )
-            }
-        }
+        // No Lamport-advance for other replicas. iCloud.com doesn't do it
+        // (verified: Mac's counter1 stays at its own max+1 even after iCloud.com
+        // appends past it). Each replica owns its own counter; touching a
+        // foreign replica's counter1 confuses Mac's notesync.
         stringFields[timestampNoteFieldIdx] =
             stringFields[timestampNoteFieldIdx].copy(payload = ProtobufWire.encode(vtFields))
 
@@ -473,11 +541,501 @@ object NoteAppender {
      * Loses CRDT history but matches Mac's own write pattern, so Mac's merge
      * logic should accept it identically to a Mac self-edit.
      */
+    /**
+     * Replace the note body with [newFullBody] entirely. Tombstones all existing
+     * live substrings and writes a single new substring containing [newFullBody].
+     * Use this for non-pure-append edits (mid-string changes, deletions, format
+     * tweaks). It loses CRDT history but produces a body Mac will render exactly
+     * as [newFullBody].
+     */
+    fun setBodyBase64(
+        textDataEncryptedB64: String,
+        ourReplicaUuid: ByteArray,
+        newFullBody: String,
+        nowEpochSec: Long,
+    ): String {
+        require(ourReplicaUuid.size == 16) { "ourReplicaUuid must be 16 bytes" }
+        val compressed = Base64.decode(textDataEncryptedB64)
+        val format = Gzip.detect(compressed)
+        val proto = Gzip.decompress(compressed)
+        Log.i(TAG, "setBodyBase64 IN: bodyLen=${newFullBody.length} protoLen=${proto.size} format=$format")
+        Log.i(TAG, "setBodyBase64 IN  proto: ${NoteBodyEditor.summarize(proto)}")
+        val newProto = setBodyBytes(proto, ourReplicaUuid, newFullBody, nowEpochSec)
+        Log.i(TAG, "setBodyBase64 OUT proto: ${NoteBodyEditor.summarize(newProto)}")
+        val newCompressed = Gzip.compress(newProto, format)
+        return Base64.encode(newCompressed)
+    }
+
+    fun setBodyBytes(
+        protoBytes: ByteArray,
+        ourReplicaUuid: ByteArray,
+        newFullBody: String,
+        nowEpochSec: Long,
+    ): ByteArray = setBodySpliceBytes(protoBytes, ourReplicaUuid, newFullBody, nowEpochSec)
+
+    /**
+     * Splice-based mid-edit. Mirrors iCloud.com's pattern verified by capturing
+     * its outgoing proto on a typed-then-edited test note:
+     *
+     *  1. Promote ourselves to replica slot 1; demote everyone else by one;
+     *     remap every existing substring's CharID.replicaID + timestamp.replicaID.
+     *  2. Walk the substring tree to build (visiblePos -> originalSubIdx + offset)
+     *     and the chain-order list.
+     *  3. Compute a longest-common-prefix / longest-common-suffix diff against
+     *     [newFullBody]. The middle (deleteFrom..deleteTo in visible space) is
+     *     the splice region; [insertText] is what goes there instead.
+     *  4. SPLIT the substring(s) that straddle the splice boundaries: the kept
+     *     left part keeps the original (R, C0)+offset; the deleted part gets
+     *     tombstoned at (R, C0+offset)+(deleteLenInThisSub); the kept right
+     *     part is (R, C0+offset+deleteLenInThisSub)+(remainder).
+     *  5. Tombstone any substrings that were entirely inside the splice region.
+     *  6. Insert ONE new substring with our (replicaID=1, ourCharIDClock+) and
+     *     length = insertText.length, content = insertText. Anchor it between
+     *     the kept-left and the tombstoned-middle so tree walk sees:
+     *        ...prefix... -> NEW -> ...tombstones... -> ...suffix...
+     *  7. Rebuild the substring list in chain order and re-emit field-3 entries.
+     *  8. Rebuild flat (String.string) as the concat of non-tombstoned chars in
+     *     tree-walk order.
+     *  9. Rebuild attribute_runs as ONE run covering the new visible length —
+     *     iCloud.com keeps multiple runs but for now we collapse (formatting
+     *     fidelity is a TODO; visible text correctness comes first).
+     * 10. Bump our replica's counter1 by insertText.length.
+     */
+    fun setBodySpliceBytes(
+        protoBytes: ByteArray,
+        ourReplicaUuid: ByteArray,
+        newFullBody: String,
+        nowEpochSec: Long,
+    ): ByteArray {
+        require(ourReplicaUuid.size == 16)
+        val kind = NoteBodyEditor.probe(protoBytes)
+        require(kind == NoteProtoKind.NOTE_STORE_PROTO) { "Cannot splice a $kind body." }
+
+        // Decode wrapper.
+        val top = ProtobufWire.decode(protoBytes).toMutableList()
+        val versionIdx = top.indexOfFirst {
+            it.fieldNumber == FIELD_OUTER_VERSION && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        require(versionIdx >= 0)
+        val versionFields = ProtobufWire.decode(top[versionIdx].payload).toMutableList()
+        val dataIdx = versionFields.indexOfFirst {
+            it.fieldNumber == FIELD_VERSION_DATA && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        require(dataIdx >= 0)
+        val stringFields = ProtobufWire.decode(versionFields[dataIdx].payload).toMutableList()
+
+        val origSubs = parseSubstrings(stringFields)
+        require(origSubs.isNotEmpty())
+        val sentinelOrig = origSubs.last()
+        require(
+            sentinelOrig.charIDReplicaID == SENTINEL_REPLICA_ID && sentinelOrig.charIDClock == SENTINEL_CLOCK,
+        ) { "Last substring is not the sentinel" }
+
+        val flatFieldIdx = stringFields.indexOfFirst {
+            it.fieldNumber == FIELD_STRING_STRING && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        require(flatFieldIdx >= 0)
+        val origFlat = stringFields[flatFieldIdx].payload.decodeToString()
+
+        // Walk tree (via child[0]) collecting chain order + per-substring flat slice.
+        // origSubs is in array (proto field) order; chainOrder follows children pointers.
+        val origFlatOffsets = IntArray(origSubs.size)
+        run {
+            var off = 0
+            for (s in origSubs) {
+                origFlatOffsets[s.arrayIdx] = off
+                if (!s.tombstone) off += s.length.toInt()
+            }
+        }
+        val chainArrayIdxes = mutableListOf<Int>()
+        run {
+            var cur = 0
+            val visited = BooleanArray(origSubs.size)
+            while (cur in origSubs.indices && !visited[cur]) {
+                visited[cur] = true
+                chainArrayIdxes.add(cur)
+                cur = origSubs[cur].children.firstOrNull() ?: break
+            }
+        }
+
+        // Build the chain-ordered list as our working "substring list". Each
+        // entry tracks its origin (so we can preserve replicaIDs/clocks/etc),
+        // the chars that contribute to flat (empty for tombstones), and a
+        // tombstone flag.
+        data class S(
+            val origArrayIdx: Int, // -1 = newly inserted
+            val replica: Long,
+            val clock: Long,
+            val length: Long,
+            val tsReplica: Long,
+            val tsClock: Long,
+            var tombstone: Boolean,
+            val chars: String, // empty if tombstoned or zero-length
+        )
+
+        val chain = mutableListOf<S>()
+        for (idx in chainArrayIdxes) {
+            val s = origSubs[idx]
+            val isSentinel = s.charIDReplicaID == SENTINEL_REPLICA_ID && s.charIDClock == SENTINEL_CLOCK
+            val chars = if (s.tombstone || isSentinel || s.length == 0L) ""
+            else origFlat.substring(origFlatOffsets[s.arrayIdx], origFlatOffsets[s.arrayIdx] + s.length.toInt())
+            chain.add(
+                S(
+                    origArrayIdx = s.arrayIdx,
+                    replica = s.charIDReplicaID,
+                    clock = s.charIDClock,
+                    length = s.length,
+                    tsReplica = s.timestampReplicaID,
+                    tsClock = s.timestampClock,
+                    tombstone = s.tombstone,
+                    chars = chars,
+                ),
+            )
+        }
+
+        // Compute currentVisible & visiblePos -> chain index + intra-substring offset.
+        val visibleSb = StringBuilder()
+        // Maps each visible position to (chainIndex, offsetWithinSubstring).
+        val visibleToChain = mutableListOf<Pair<Int, Int>>()
+        for ((ci, s) in chain.withIndex()) {
+            if (s.tombstone || s.chars.isEmpty()) continue
+            for (i in s.chars.indices) {
+                visibleSb.append(s.chars[i])
+                visibleToChain.add(Pair(ci, i))
+            }
+        }
+        val currentVisible = visibleSb.toString()
+        if (currentVisible == newFullBody) {
+            Log.i(TAG, "setBodySplice: no-op (current visible matches target)")
+            return protoBytes
+        }
+        Log.i(
+            TAG,
+            "setBodySplice: currentVisible.len=${currentVisible.length} newBody.len=${newFullBody.length}",
+        )
+
+        // Diff: longest common prefix + longest common suffix.
+        val maxPrefix = minOf(currentVisible.length, newFullBody.length)
+        var prefixLen = 0
+        while (prefixLen < maxPrefix && currentVisible[prefixLen] == newFullBody[prefixLen]) prefixLen++
+        var suffixLen = 0
+        while (
+            suffixLen < currentVisible.length - prefixLen &&
+            suffixLen < newFullBody.length - prefixLen &&
+            currentVisible[currentVisible.length - 1 - suffixLen] ==
+                newFullBody[newFullBody.length - 1 - suffixLen]
+        ) suffixLen++
+        val deleteFrom = prefixLen
+        val deleteTo = currentVisible.length - suffixLen
+        val insertText = newFullBody.substring(prefixLen, newFullBody.length - suffixLen)
+        val deleteLen = deleteTo - deleteFrom
+        Log.i(
+            TAG,
+            "setBodySplice diff: prefix=$prefixLen suffix=$suffixLen " +
+                "deleteFrom=$deleteFrom deleteTo=$deleteTo deleteLen=$deleteLen " +
+                "insertLen=${insertText.length}",
+        )
+
+        // ===== Slot promotion: ourselves to slot 1 =====
+        val timestampNoteFieldIdx = stringFields.indexOfFirst {
+            it.fieldNumber == FIELD_STRING_TIMESTAMP && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        require(timestampNoteFieldIdx >= 0)
+        val vtFields = ProtobufWire.decode(stringFields[timestampNoteFieldIdx].payload).toMutableList()
+        val clocks = parseVectorTimestamp(vtFields)
+        val ourClock = clocks.firstOrNull { it.uuid.contentEquals(ourReplicaUuid) }
+        val maxDocCharIDClock = origSubs.maxOfOrNull {
+            if (it.charIDReplicaID == SENTINEL_REPLICA_ID && it.charIDClock == SENTINEL_CLOCK) -1L
+            else if (it.length == 0L) it.charIDClock - 1
+            else it.charIDClock + it.length - 1
+        } ?: -1L
+        val maxDocTimestampClock = origSubs.maxOfOrNull {
+            if (it.charIDReplicaID == SENTINEL_REPLICA_ID && it.charIDClock == SENTINEL_CLOCK) -1L
+            else it.timestampClock
+        } ?: 0L
+
+        val oldOurSlot = ourClock?.replicaID
+        val replicaRemap = HashMap<Int, Int>()
+        if (oldOurSlot != null) {
+            for (c in clocks) {
+                replicaRemap[c.replicaID] = when {
+                    c.replicaID == oldOurSlot -> 1
+                    c.replicaID < oldOurSlot -> c.replicaID + 1
+                    else -> c.replicaID
+                }
+            }
+        } else {
+            for (c in clocks) replicaRemap[c.replicaID] = c.replicaID + 1
+        }
+        val savedByNewSlot = HashMap<Int, ProtobufWire.Field>()
+        for (c in clocks) savedByNewSlot[replicaRemap[c.replicaID]!!] = vtFields[c.vtFieldIdx]
+        vtFields.removeAll {
+            it.fieldNumber == FIELD_VT_CLOCK && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        val ourReplicaID = 1
+        val ourCharIDClockStart = if (ourClock != null) {
+            require(ourClock.replicaClocks.size == 2)
+            maxOf(ourClock.replicaClocks[0].clock, maxDocCharIDClock + 1)
+        } else {
+            maxDocCharIDClock + 1
+        }
+        val ourTimestampClock = ourClock?.replicaClocks?.get(1)?.clock ?: 0L
+        // Slot 1 entry — placeholder bytes; we rebuild it after we know the
+        // post-edit counter1 (clock + insertText.length).
+        val ourClockListIdx = vtFields.size
+        if (ourClock != null) {
+            vtFields.add(savedByNewSlot[1]!!)
+        } else {
+            vtFields.add(buildClockEntry(ourReplicaUuid, ourCharIDClockStart, maxDocTimestampClock))
+        }
+        val totalSlots = clocks.size + (if (ourClock == null) 1 else 0)
+        for (newSlot in 2..totalSlots) {
+            savedByNewSlot[newSlot]?.let { vtFields.add(it) }
+        }
+
+        // Apply remap to the chain entries' replica IDs.
+        for ((i, s) in chain.withIndex()) {
+            val newCharRep = replicaRemap[s.replica.toInt()]
+            val newTsRep = replicaRemap[s.tsReplica.toInt()]
+            if ((newCharRep != null && newCharRep.toLong() != s.replica) ||
+                (newTsRep != null && newTsRep.toLong() != s.tsReplica)
+            ) {
+                chain[i] = s.copy(
+                    replica = newCharRep?.toLong() ?: s.replica,
+                    tsReplica = newTsRep?.toLong() ?: s.tsReplica,
+                )
+            }
+        }
+
+        // ===== Splice =====
+        // We're going to perform a sequence of operations on `chain`:
+        //   (a) Find chain indices that straddle deleteFrom and deleteTo.
+        //   (b) SPLIT entries that straddle (so the boundary lines up exactly
+        //       with chain entries).
+        //   (c) Mark every entry covering [deleteFrom, deleteTo) as tombstoned.
+        //   (d) Insert ONE new entry for insertText at the boundary.
+        //
+        // Implementation: walk visible positions to find boundary chain idxs.
+        // (visibleToChain might not work well after splits; rebuild after each.)
+        //
+        // We split at the boundaries and then collect all live entries that
+        // overlap [deleteFrom, deleteTo) and tombstone them in-place.
+
+        // Helper: split chain entry at intra-substring offset `off`. Returns
+        // the chainIndex of the new RIGHT half.
+        fun splitChainEntryAt(chainIdx: Int, off: Int): Int {
+            val s = chain[chainIdx]
+            require(!s.tombstone) { "split called on tombstone (chainIdx=$chainIdx)" }
+            require(off in 0..s.length.toInt()) { "split offset out of range" }
+            if (off == 0 || off == s.length.toInt()) return chainIdx // no actual split needed
+            val leftLen = off
+            val rightLen = s.length.toInt() - off
+            val left = s.copy(
+                length = leftLen.toLong(),
+                chars = s.chars.substring(0, leftLen),
+            )
+            val right = s.copy(
+                clock = s.clock + leftLen,
+                tsClock = s.tsClock, // keep same style timestamp; both halves originated together
+                length = rightLen.toLong(),
+                chars = s.chars.substring(leftLen),
+            )
+            chain[chainIdx] = left
+            chain.add(chainIdx + 1, right)
+            return chainIdx + 1
+        }
+
+        // Find the chain index whose live chars cover visible position `pos`.
+        // Returns Pair(chainIdx, offsetWithin). If pos == currentVisible.length,
+        // returns Pair(chain.size, 0) meaning "after the last entry" (insert at end).
+        fun findChainAtVisible(pos: Int): Pair<Int, Int> {
+            var seen = 0
+            for ((ci, s) in chain.withIndex()) {
+                if (s.tombstone || s.chars.isEmpty()) continue
+                if (pos < seen + s.chars.length) return Pair(ci, pos - seen)
+                seen += s.chars.length
+            }
+            return Pair(chain.size, 0)
+        }
+
+        // Split at deleteFrom (start of edit region).
+        val (fromChainIdx, fromOff) = findChainAtVisible(deleteFrom)
+        val insertAfterChainIdx: Int =
+            if (fromChainIdx >= chain.size) {
+                // Pure append at end: insert before sentinel.
+                val sentIdx = chain.indexOfFirst {
+                    it.replica == SENTINEL_REPLICA_ID && it.clock == SENTINEL_CLOCK
+                }
+                if (sentIdx >= 0) sentIdx - 1 else chain.size - 1
+            } else if (fromOff == 0) {
+                fromChainIdx - 1 // insert AFTER the previous entry (so we appear before fromChainIdx in chain)
+            } else {
+                splitChainEntryAt(fromChainIdx, fromOff)
+                // After split, the left half stays at fromChainIdx, the right half is at fromChainIdx+1.
+                fromChainIdx
+            }
+
+        // After the optional split, recompute (fromChainIdx, fromOff) for the
+        // RIGHT half (which will be tombstoned start).
+        val (rightStartChainIdx, _) = findChainAtVisible(deleteFrom)
+
+        // Split at deleteTo (end of edit region).
+        if (deleteLen > 0) {
+            val (toChainIdx, toOff) = findChainAtVisible(deleteTo)
+            if (toChainIdx < chain.size && toOff > 0) {
+                splitChainEntryAt(toChainIdx, toOff)
+                // Now the chunk to tombstone ends at original toChainIdx; the kept right is at toChainIdx+1.
+            }
+        }
+
+        // Tombstone every chain entry from rightStartChainIdx up to (but not
+        // including) the first entry that begins at visiblePos == deleteTo.
+        // CRITICAL: each NEW tombstone gets a FRESH timestamp signed by us
+        // (replicaID=1, fresh ts clock). Mac's notesync compares the substring's
+        // timestamp to its local view; if the tombstone's ts is the SAME as
+        // what Mac's local copy has (i.e., the original Mac ts), Mac decides
+        // "this isn't a new event" and ignores the tombstone. Verified by
+        // capturing iCloud.com's mid-edit traffic: every new tombstone it
+        // emits has ts=(1, freshClock), where 1 is iCloud.com's slot.
+        var freshTsClock = maxDocTimestampClock + 1
+        if (deleteLen > 0) {
+            // Re-find rightStartChainIdx after possible second split (indices may have shifted).
+            val rsi = findChainAtVisible(deleteFrom).first
+            // Find chainIdx at deleteTo (after split, this is the kept right half).
+            val keepRightChainIdx = findChainAtVisible(deleteTo).first
+            for (ci in rsi until keepRightChainIdx) {
+                val e = chain[ci]
+                if (!e.tombstone &&
+                    !(e.replica == SENTINEL_REPLICA_ID && e.clock == SENTINEL_CLOCK) &&
+                    e.length > 0L
+                ) {
+                    chain[ci] = e.copy(
+                        tombstone = true,
+                        chars = "",
+                        tsReplica = ourReplicaID.toLong(),
+                        tsClock = freshTsClock,
+                    )
+                    freshTsClock++
+                }
+            }
+        }
+
+        // Insert a NEW entry for insertText, anchored AFTER `insertAfterChainIdx`.
+        // Use our (replicaID=1, ourCharIDClockStart) for the new substring.
+        if (insertText.isNotEmpty()) {
+            val newEntry = S(
+                origArrayIdx = -1,
+                replica = ourReplicaID.toLong(),
+                clock = ourCharIDClockStart,
+                length = insertText.length.toLong(),
+                tsReplica = ourReplicaID.toLong(),
+                tsClock = ourTimestampClock,
+                tombstone = false,
+                chars = insertText,
+            )
+            // Insert at index = insertAfterChainIdx + 1.
+            chain.add(insertAfterChainIdx + 1, newEntry)
+        }
+
+        // ===== Rebuild the proto =====
+        // Rebuild stringFields:
+        //  - Keep field 2 (String.string) — replace payload below
+        //  - Keep field 4 (timestamp / VectorTimestamp) — already updated vtFields
+        //  - Keep attribute_runs (field 5) — replace below
+        //  - Replace all field 3 (substrings) with our new chain-ordered list
+
+        // Build the new flat from chain entries (chars, in order).
+        val newFlatSb = StringBuilder()
+        for (s in chain) {
+            if (!s.tombstone && s.chars.isNotEmpty()) newFlatSb.append(s.chars)
+        }
+        val newFlat = newFlatSb.toString()
+
+        // Build new substring fields. Children: each entry's child[0] = chainIdx+1
+        // (i.e., the next chain entry's array index, which matches its position
+        // in the new field-3 list). The sentinel keeps children=[].
+        val newSubstringFields = ArrayList<ProtobufWire.Field>(chain.size)
+        for ((ci, s) in chain.withIndex()) {
+            val isSentinel = s.replica == SENTINEL_REPLICA_ID && s.clock == SENTINEL_CLOCK
+            val children = if (isSentinel) emptyList<Int>() else listOf(ci + 1)
+            newSubstringFields.add(
+                buildSubstring(
+                    charIDReplicaID = s.replica,
+                    charIDClock = s.clock,
+                    length = s.length,
+                    timestampReplicaID = s.tsReplica,
+                    timestampClock = s.tsClock,
+                    tombstone = s.tombstone,
+                    children = children,
+                ),
+            )
+        }
+
+        // Compose the new stringFields list:
+        //   field 2 (string)         -- replace payload with newFlat bytes
+        //   field 3 (substring)*     -- newSubstringFields (in chain order)
+        //   field 4 (timestamp)      -- vtFields (already rebuilt)
+        //   field 5 (attribute_run)+ -- single run with length = newFlat.length, font from last existing
+        val templateFont = lastAttributeRunFont(stringFields)
+        val newAttrRun = buildAttributeRun(length = newFlat.length, fontFields = templateFont)
+
+        val rebuiltStringFields = ArrayList<ProtobufWire.Field>()
+        rebuiltStringFields.add(
+            ProtobufWire.Field(
+                FIELD_STRING_STRING,
+                ProtobufWire.WIRE_LENGTH_DELIM,
+                newFlat.encodeToByteArray(),
+            ),
+        )
+        rebuiltStringFields.addAll(newSubstringFields)
+        rebuiltStringFields.add(
+            ProtobufWire.Field(
+                FIELD_STRING_TIMESTAMP,
+                ProtobufWire.WIRE_LENGTH_DELIM,
+                ProtobufWire.encode(vtFields),
+            ),
+        )
+        rebuiltStringFields.add(newAttrRun)
+        // Preserve any other fields we don't touch (e.g., attachments at field 6).
+        for (f in stringFields) {
+            when (f.fieldNumber) {
+                FIELD_STRING_STRING, FIELD_STRING_SUBSTRING,
+                FIELD_STRING_TIMESTAMP, FIELD_STRING_ATTRIBUTE_RUN -> Unit
+                else -> rebuiltStringFields.add(f)
+            }
+        }
+
+        // Bump our replica's counter1 to ourCharIDClockStart + insertText.length
+        // (the next-to-allocate clock for us). counter2 stays at maxDocTimestamp.
+        val newCharIDClock = ourCharIDClockStart + insertText.length
+        vtFields[ourClockListIdx] = if (ourClock != null) {
+            updateExistingClockInPlace(vtFields[ourClockListIdx], newCharIDClock, maxDocTimestampClock)
+        } else {
+            buildClockEntry(ourReplicaUuid, newCharIDClock, maxDocTimestampClock)
+        }
+        // Replace the timestamp field in rebuiltStringFields with the bumped one.
+        val tsIdx = rebuiltStringFields.indexOfFirst {
+            it.fieldNumber == FIELD_STRING_TIMESTAMP && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        rebuiltStringFields[tsIdx] = ProtobufWire.Field(
+            FIELD_STRING_TIMESTAMP,
+            ProtobufWire.WIRE_LENGTH_DELIM,
+            ProtobufWire.encode(vtFields),
+        )
+
+        versionFields[dataIdx] = versionFields[dataIdx].copy(
+            payload = ProtobufWire.encode(rebuiltStringFields),
+        )
+        top[versionIdx] = top[versionIdx].copy(payload = ProtobufWire.encode(versionFields))
+        return ProtobufWire.encode(top)
+    }
+
     fun rewriteWithTombstoneBytes(
         protoBytes: ByteArray,
         ourReplicaUuid: ByteArray,
         appendedText: String,
         nowEpochSec: Long,
+        overrideFullBody: String? = null,
     ): ByteArray {
         val kind = NoteBodyEditor.probe(protoBytes)
         require(kind == NoteProtoKind.NOTE_STORE_PROTO) {
@@ -514,7 +1072,7 @@ object NoteAppender {
         }
         require(stringFieldIdx >= 0) { "no String.string" }
         val originalText = stringFields[stringFieldIdx].payload.decodeToString()
-        val newBody = originalText + appendedText
+        val newBody = overrideFullBody ?: (originalText + appendedText)
 
         // Compute Lamport state.
         val maxDocCharIDClock = substrings.maxOfOrNull {
@@ -535,24 +1093,97 @@ object NoteAppender {
         val vtFields = ProtobufWire.decode(stringFields[timestampNoteFieldIdx].payload).toMutableList()
         val clocks = parseVectorTimestamp(vtFields)
         val ourClock = clocks.firstOrNull { it.uuid.contentEquals(ourReplicaUuid) }
-        val ourReplicaID: Int
-        val ourClockListIdx: Int
+
+        // ===== Slot promotion (mirrors iCloud.com's pattern) =====
+        // Promote ourselves to replica slot 1, demote everyone else by one. Mac's
+        // notesync uses the rotation as the cache-invalidation signal — without it
+        // the local cache merges our delta on top of stale state and duplicates
+        // the body.
+        val oldOurSlot = ourClock?.replicaID
+        val replicaRemap = HashMap<Int, Int>()
+        if (oldOurSlot != null) {
+            for (c in clocks) {
+                replicaRemap[c.replicaID] = when {
+                    c.replicaID == oldOurSlot -> 1
+                    c.replicaID < oldOurSlot -> c.replicaID + 1
+                    else -> c.replicaID
+                }
+            }
+        } else {
+            for (c in clocks) replicaRemap[c.replicaID] = c.replicaID + 1
+        }
+        val savedByNewSlot = HashMap<Int, ProtobufWire.Field>()
+        for (c in clocks) savedByNewSlot[replicaRemap[c.replicaID]!!] = vtFields[c.vtFieldIdx]
+        vtFields.removeAll {
+            it.fieldNumber == FIELD_VT_CLOCK && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        val ourReplicaID: Int = 1
+        val ourClockListIdx: Int = vtFields.size
         val isFirstEdit: Boolean
         val ourCharIDClockStart: Long
         if (ourClock != null) {
-            ourReplicaID = ourClock.replicaID
-            ourClockListIdx = ourClock.vtFieldIdx
             isFirstEdit = false
             require(ourClock.replicaClocks.size == 2) { "Clock entry needs 2 ReplicaClocks" }
             ourCharIDClockStart = maxOf(ourClock.replicaClocks[0].clock, maxDocCharIDClock + 1)
+            vtFields.add(savedByNewSlot[1]!!)
         } else {
-            ourReplicaID = clocks.size + 1
-            ourClockListIdx = vtFields.size
             isFirstEdit = true
-            // Mac's set-body uses charID.clock = max-doc-clock + 1 (see ref-152233).
             ourCharIDClockStart = maxDocCharIDClock + 1
             vtFields.add(buildClockEntry(ourReplicaUuid, ourCharIDClockStart, maxDocTimestampClock))
-            Log.i(TAG, "REWRITE: registered replica idx=$ourReplicaID")
+            Log.i(TAG, "REWRITE: registered replica + promoted to slot 1")
+        }
+        val totalSlots = clocks.size + (if (ourClock == null) 1 else 0)
+        for (newSlot in 2..totalSlots) {
+            savedByNewSlot[newSlot]?.let { vtFields.add(it) }
+        }
+        Log.i(
+            TAG,
+            "REWRITE promoted self to slot 1: oldSlot=$oldOurSlot remap=$replicaRemap"
+        )
+
+        // Rewrite all existing substrings' replicaIDs via remap.
+        for (subEntry in substrings) {
+            val isSentinel = subEntry.charIDReplicaID == SENTINEL_REPLICA_ID && subEntry.charIDClock == SENTINEL_CLOCK
+            if (isSentinel) continue
+            if (subEntry.arrayIdx == 0) continue
+            val noteIdx = subEntry.noteFieldIdx
+            val subFields = ProtobufWire.decode(stringFields[noteIdx].payload).toMutableList()
+            var subChanged = false
+            val charIdx = subFields.indexOfFirst {
+                it.fieldNumber == FIELD_SUBSTRING_CHARID && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }
+            if (charIdx >= 0) {
+                val newRid = replicaRemap[subEntry.charIDReplicaID.toInt()]
+                if (newRid != null && newRid != subEntry.charIDReplicaID.toInt()) {
+                    val cf = ProtobufWire.decode(subFields[charIdx].payload).toMutableList()
+                    val ridIdx = cf.indexOfFirst {
+                        it.fieldNumber == FIELD_CHARID_REPLICA_ID && it.wireType == ProtobufWire.WIRE_VARINT
+                    }
+                    if (ridIdx >= 0) cf[ridIdx] = ProtobufWire.encodeVarintField(FIELD_CHARID_REPLICA_ID, newRid.toLong())
+                    else cf.add(0, ProtobufWire.encodeVarintField(FIELD_CHARID_REPLICA_ID, newRid.toLong()))
+                    subFields[charIdx] = subFields[charIdx].copy(payload = ProtobufWire.encode(cf))
+                    subChanged = true
+                }
+            }
+            val tsIdx = subFields.indexOfFirst {
+                it.fieldNumber == FIELD_SUBSTRING_TIMESTAMP && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }
+            if (tsIdx >= 0) {
+                val newRid = replicaRemap[subEntry.timestampReplicaID.toInt()]
+                if (newRid != null && newRid != subEntry.timestampReplicaID.toInt()) {
+                    val tf = ProtobufWire.decode(subFields[tsIdx].payload).toMutableList()
+                    val ridIdx = tf.indexOfFirst {
+                        it.fieldNumber == FIELD_CHARID_REPLICA_ID && it.wireType == ProtobufWire.WIRE_VARINT
+                    }
+                    if (ridIdx >= 0) tf[ridIdx] = ProtobufWire.encodeVarintField(FIELD_CHARID_REPLICA_ID, newRid.toLong())
+                    else tf.add(0, ProtobufWire.encodeVarintField(FIELD_CHARID_REPLICA_ID, newRid.toLong()))
+                    subFields[tsIdx] = subFields[tsIdx].copy(payload = ProtobufWire.encode(tf))
+                    subChanged = true
+                }
+            }
+            if (subChanged) {
+                stringFields[noteIdx] = stringFields[noteIdx].copy(payload = ProtobufWire.encode(subFields))
+            }
         }
 
         val newSubstringLen = newBody.length.toLong()
@@ -562,19 +1193,37 @@ object NoteAppender {
                 "newBodyLen=$newSubstringLen (was ${originalText.length}, +${appendedText.length})",
         )
 
-        // Tombstone every existing live substring (skip doc-start at index 0 and sentinel at last).
+        // Tombstone every existing live substring AND increment its children by 1
+        // (we're about to insert OUR new substring at array index 1, which shifts
+        // every other substring's array index by +1). Skip doc-start (index 0) —
+        // its children value [1] stays at [1], naturally pointing at our new
+        // substring after the shift. This matches Mac's own set-body pattern
+        // (verified by capturing its post-edit proto).
         for (sub in substrings) {
-            if (sub.arrayIdx == 0) continue // doc-start
-            if (sub.arrayIdx == sentinelArrayIdx) continue // sentinel
-            if (sub.tombstone) continue // already tombstoned
+            val isDocStart = sub.arrayIdx == 0
+            val isSentinel = sub.arrayIdx == sentinelArrayIdx
             val noteFieldIdx = sub.noteFieldIdx
             val subFields = ProtobufWire.decode(stringFields[noteFieldIdx].payload).toMutableList()
-            // Remove any existing tombstone fields, add tombstone=true.
-            subFields.removeAll {
-                it.fieldNumber == FIELD_SUBSTRING_TOMBSTONE && it.wireType == ProtobufWire.WIRE_VARINT
+            var changed = false
+            if (!isDocStart) {
+                // Increment every child[] entry — they all reference substrings
+                // that shifted (any index >= 1 was bumped by +1).
+                rewriteSubstringChildren(subFields) { children ->
+                    children.map { it + 1 }
+                }
+                changed = true
             }
-            subFields.add(ProtobufWire.encodeVarintField(FIELD_SUBSTRING_TOMBSTONE, 1L))
-            stringFields[noteFieldIdx] = stringFields[noteFieldIdx].copy(payload = ProtobufWire.encode(subFields))
+            if (!isDocStart && !isSentinel && !sub.tombstone) {
+                // Mark this substring as tombstoned (its content is no longer live).
+                subFields.removeAll {
+                    it.fieldNumber == FIELD_SUBSTRING_TOMBSTONE && it.wireType == ProtobufWire.WIRE_VARINT
+                }
+                subFields.add(ProtobufWire.encodeVarintField(FIELD_SUBSTRING_TOMBSTONE, 1L))
+                changed = true
+            }
+            if (changed) {
+                stringFields[noteFieldIdx] = stringFields[noteFieldIdx].copy(payload = ProtobufWire.encode(subFields))
+            }
         }
 
         // Bump our replica's counter1 to clock + len, counter2 = max-doc-timestamp.
@@ -592,6 +1241,10 @@ object NoteAppender {
         stringFields[stringFieldIdx] = stringFields[stringFieldIdx].copy(payload = newBody.encodeToByteArray())
 
         // Build new substring with full body length.
+        // It will be inserted at array index 1 (just after doc-start). All other
+        // substrings shift to index+1. Our child[0] points at the substring that
+        // was at array index 1 before insertion (now at index 2 after shift).
+        // Mac's pattern: NEW(1) -> OLD-tombstoned(2) -> ... -> sentinel(last).
         val ourSubstring = buildSubstring(
             charIDReplicaID = ourReplicaID.toLong(),
             charIDClock = ourCharIDClockStart,
@@ -599,10 +1252,12 @@ object NoteAppender {
             timestampReplicaID = ourReplicaID.toLong(),
             timestampClock = 0L,
             tombstone = false,
-            children = listOf(sentinelArrayIdx + 1),
+            children = listOf(2),
         )
-        // Insert at sentinel's slot, pushing sentinel back.
-        stringFields.add(sentinelNoteFieldIdx, ourSubstring)
+        // Find the proto-field index of doc-start (array idx 0) so we insert
+        // OUR substring as the next field after it.
+        val docStartNoteFieldIdx = substrings.first { it.arrayIdx == 0 }.noteFieldIdx
+        stringFields.add(docStartNoteFieldIdx + 1, ourSubstring)
 
         // Rewrite the attribute_runs: drop existing, add ONE covering full body.
         val attrIdxs = stringFields.withIndex()

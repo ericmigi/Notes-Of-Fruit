@@ -324,6 +324,13 @@ class AppleNotesClient(
         newTextDataEncryptedB64: String,
         newTitle: String? = null,
         newSnippet: String? = null,
+        // The encrypted-bytes value of `ReplicaIDToNotesVersionDataEncrypted`
+        // from the lookupNote that produced [recordChangeTag]. Pass it through
+        // unchanged in the modify request — Mac's notesync seems to use a
+        // change to this field as the "refresh local cache from iCloud" signal.
+        // Without it, Mac's local cache can diverge from iCloud (we observed
+        // duplication after Android append on multi-substring typed notes).
+        replicaVersionPassThroughB64: String? = null,
     ): NoteRecord {
         val payload: JsonObject = buildJsonObject {
             put("zoneID", buildJsonObject { put("zoneName", "Notes") })
@@ -349,6 +356,12 @@ class AppleNotesClient(
                                 put("SnippetEncrypted", buildJsonObject {
                                     put("type", "ENCRYPTED_STRING")
                                     put("value", kotlin.io.encoding.Base64.encode(newSnippet.encodeToByteArray()))
+                                })
+                            }
+                            if (replicaVersionPassThroughB64 != null) {
+                                put("ReplicaIDToNotesVersionDataEncrypted", buildJsonObject {
+                                    put("type", "ENCRYPTED_BYTES")
+                                    put("value", replicaVersionPassThroughB64)
                                 })
                             }
                         })
@@ -428,6 +441,23 @@ class AppleNotesClient(
             if (label == "lookupNote") {
                 Log.i(TAG, "$label replicas dump:\n${NoteBodyEditor.dumpReplicasBase64(textB64)}")
                 Log.i(TAG, "$label attribute_runs dump:\n${NoteBodyEditor.dumpAttributeRunsBase64(textB64)}")
+                // Compare bag (insertion-order String.string) with visible-text walk.
+                // Mismatch => tombstoned content exists, or our walk is wrong.
+                val bag = NoteBodyEditor.readTextFromBase64(textB64)
+                val visible = NoteBodyEditor.readVisibleTextFromBase64(textB64)
+                Log.i(
+                    TAG,
+                    "$label bag.len=${bag?.length ?: -1} visible.len=${visible?.length ?: -1} " +
+                        "match=${bag != null && bag == visible}",
+                )
+                // Escape \n so each value fits on one logcat line — makes shell
+                // parsing in test harnesses ergonomic.
+                val esc = { s: String? ->
+                    s?.take(200)?.replace("\\", "\\\\")?.replace("\n", "\\n") ?: "<null>"
+                }
+                Log.i(TAG, "$label bag='${esc(bag)}'")
+                Log.i(TAG, "$label visible='${esc(visible)}'")
+                Log.i(TAG, "$label substring tree:\n${NoteBodyEditor.dumpSubstringTreeBase64(textB64)}")
             }
         } else {
             Log.i(TAG, "$label has no TextDataEncrypted in returned fields (keys=${record.rawFields.keys})")

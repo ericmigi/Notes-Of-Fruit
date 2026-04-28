@@ -136,6 +136,23 @@ class DebugReceiver : BroadcastReceiver() {
                     }
                 }
             }
+            ACTION_SET_BODY_BY_TITLE -> {
+                val title = intent.getStringExtra("title")
+                val body = intent.getStringExtra("body")
+                if (title == null || body == null) {
+                    Log.e(TAG, "SET_BODY_BY_TITLE missing title or body")
+                    return
+                }
+                launchOp("SET_BODY_BY_TITLE") { client, _ ->
+                    val match = findByTitle(client, title)
+                    if (match == null) {
+                        Log.w(TAG, "SET_BODY_BY_TITLE_NOT_FOUND title='$title'")
+                    } else {
+                        Log.i(TAG, "SET_BODY_BY_TITLE_FOUND '$title' -> ${match.recordName}")
+                        setBodyOnNote(context, client, match.recordName, body)
+                    }
+                }
+            }
             ACTION_CREATE -> {
                 val title = intent.getStringExtra("title") ?: ""
                 val body = intent.getStringExtra("body") ?: ""
@@ -188,7 +205,8 @@ class DebugReceiver : BroadcastReceiver() {
         val record = client.lookupNote(recordName)
         val tag = record.recordChangeTag ?: error("no recordChangeTag on $recordName")
         val textB64 = record.stringField("TextDataEncrypted") ?: error("no body on $recordName")
-        val originalBody = NoteBodyEditor.readTextFromBase64(textB64).orEmpty()
+        val originalBody = NoteBodyEditor.readVisibleTextFromBase64(textB64)
+            ?: NoteBodyEditor.readTextFromBase64(textB64).orEmpty()
         val now = System.currentTimeMillis() / 1000L
         val newB64 = NoteAppender.appendBase64(textB64, uuid, text, now)
         val newBody = originalBody + text
@@ -202,10 +220,51 @@ class DebugReceiver : BroadcastReceiver() {
         )
         client.modifyNoteBody(
             recordName, tag, newB64,
-            newTitle = newTitle.takeIf { it != oldTitle },
-            newSnippet = newSnippet.takeIf { it != oldSnippet },
+            // Always send Title and Snippet, even when unchanged. Mac's notesync
+            // appears to use field-update signals (not value-diff) to decide
+            // whether to refresh local cache; without these, the local cache
+            // could keep its stale CRDT view alongside our update => duplicated
+            // body in the UI.
+            newTitle = newTitle,
+            newSnippet = newSnippet,
+            replicaVersionPassThroughB64 = record.stringField("ReplicaIDToNotesVersionDataEncrypted"),
         )
         Log.i(TAG, "APPEND_OK rec=$recordName")
+    }
+
+    /**
+     * Replace the note body with [newBody] entirely via the tombstone-rewrite
+     * strategy. Used for non-pure-append edits (mid-string changes, deletions).
+     */
+    private suspend fun setBodyOnNote(
+        context: Context,
+        client: AppleNotesClient,
+        recordName: String,
+        newBody: String,
+    ) {
+        val uuid = DeviceIdentity.getOrCreate(context)
+        val record = client.lookupNote(recordName)
+        val tag = record.recordChangeTag ?: error("no recordChangeTag on $recordName")
+        val textB64 = record.stringField("TextDataEncrypted") ?: error("no body on $recordName")
+        val originalBody = NoteBodyEditor.readVisibleTextFromBase64(textB64)
+            ?: NoteBodyEditor.readTextFromBase64(textB64).orEmpty()
+        val now = System.currentTimeMillis() / 1000L
+        val newB64 = NoteAppender.setBodyBase64(textB64, uuid, newBody, now)
+        val (oldTitle, oldSnippet) = computeTitleAndSnippet(originalBody)
+        val (newTitle, newSnippet) = computeTitleAndSnippet(newBody)
+        Log.i(
+            TAG,
+            "SET_BODY rec=$recordName bodyLen=${newBody.length} " +
+                "title '${oldTitle.take(30)}'->'${newTitle.take(30)}' " +
+                "snippet '${oldSnippet.take(30)}'->'${newSnippet.take(30)}'",
+        )
+        client.modifyNoteBody(
+            recordName, tag, newB64,
+            newTitle = newTitle.takeIf { it != oldTitle },
+            newSnippet = newSnippet.takeIf { it != oldSnippet },
+            replicaVersionPassThroughB64 = record.stringField("ReplicaIDToNotesVersionDataEncrypted"),
+        )
+        Log.i(TAG, "SET_BODY_OK rec=$recordName")
     }
 
     companion object {
@@ -214,6 +273,7 @@ class DebugReceiver : BroadcastReceiver() {
         private const val ACTION_LOOKUP_BY_TITLE = "com.example.applenotes.LOOKUP_BY_TITLE"
         private const val ACTION_APPEND = "com.example.applenotes.APPEND"
         private const val ACTION_APPEND_BY_TITLE = "com.example.applenotes.APPEND_BY_TITLE"
+        private const val ACTION_SET_BODY_BY_TITLE = "com.example.applenotes.SET_BODY_BY_TITLE"
         private const val ACTION_DELETE_BY_TITLE = "com.example.applenotes.DELETE_BY_TITLE"
         private const val ACTION_CREATE = "com.example.applenotes.CREATE"
 

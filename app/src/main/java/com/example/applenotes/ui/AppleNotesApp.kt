@@ -244,15 +244,22 @@ fun AppleNotesApp() {
                             ?: error("No recordChangeTag — refresh first.")
                         val textB64 = s.record.stringField("TextDataEncrypted")
                             ?: error("No body field on this note.")
-                        val originalBody = NoteBodyEditor.readTextFromBase64(textB64).orEmpty()
+                        val originalBody = NoteBodyEditor.readVisibleTextFromBase64(textB64)
+                            ?: NoteBodyEditor.readTextFromBase64(textB64).orEmpty()
                         val now = System.currentTimeMillis() / 1000L
-                        check(isPureAppend) {
-                            "Only pure-append edits are supported — mid-string changes need " +
-                                "tree-split semantics that aren't implemented yet."
+                        // Pure-append edits go through the cheap APPEND path (one
+                        // new substring at the sentinel slot). Anything else
+                        // (replace/insert/delete in the middle) goes through the
+                        // splice path which mirrors iCloud.com's pattern: slot
+                        // promotion + split-and-tombstone with fresh ts on the
+                        // tombstones + new chunks for inserted text.
+                        val newB64 = if (isPureAppend) {
+                            val appended = newBody.removePrefix(originalBody)
+                            require(appended.isNotEmpty()) { "Pure-append marked but no new chars" }
+                            NoteAppender.appendBase64(textB64, uuid, appended, now)
+                        } else {
+                            NoteAppender.setBodyBase64(textB64, uuid, newBody, now)
                         }
-                        val appended = newBody.removePrefix(originalBody)
-                        require(appended.isNotEmpty()) { "Pure-append marked but no new chars" }
-                        val newB64 = NoteAppender.appendBase64(textB64, uuid, appended, now)
                         // Compute new title and snippet from the post-append body so
                         // Apple's Title/Snippet CloudKit fields stay in sync. Apple's
                         // clients (Mac, iCloud.com list view, our own list view) use
@@ -270,6 +277,7 @@ fun AppleNotesApp() {
                             newB64,
                             newTitle = newTitle.takeIf { it != oldTitle },
                             newSnippet = newSnippet.takeIf { it != oldSnippet },
+                            replicaVersionPassThroughB64 = s.record.stringField("ReplicaIDToNotesVersionDataEncrypted"),
                         )
                         state = ScreenState.Detail(s.session, updated)
                         lastSavedHint = "Saved to iCloud. Mac users may need to quit & reopen Notes.app to see changes."
@@ -589,7 +597,8 @@ private fun NoteDetailScreen(
     }
     val originalBody = remember(record.recordName, record.recordChangeTag) {
         record.stringField("TextDataEncrypted")?.let { b64 ->
-            runCatching { NoteBodyEditor.readTextFromBase64(b64) }.getOrNull()
+            runCatching { NoteBodyEditor.readVisibleTextFromBase64(b64) }.getOrNull()
+                ?: runCatching { NoteBodyEditor.readTextFromBase64(b64) }.getOrNull()
         }.orEmpty()
     }
     var bodyDraft by remember(record.recordName, record.recordChangeTag) {
@@ -619,7 +628,7 @@ private fun NoteDetailScreen(
                     actions = {
                         if (isModified) {
                             IconButton(
-                                enabled = !saving && isPureAppend,
+                                enabled = !saving,
                                 onClick = { onSave(bodyDraft, isPureAppend) },
                             ) {
                                 Icon(Icons.Default.Check, contentDescription = "Save")
@@ -646,21 +655,6 @@ private fun NoteDetailScreen(
         Column(
             modifier = Modifier.fillMaxSize().padding(padding),
         ) {
-            if (isModified && !isPureAppend) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(MaterialTheme.colorScheme.errorContainer)
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                ) {
-                    Text(
-                        "Only pure-append edits can be saved right now. Mid-string edits and " +
-                            "deletions need CRDT tombstone ops that aren't implemented yet — " +
-                            "saving them would corrupt the note across all your devices.",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-            }
             BasicTextField(
                 value = bodyDraft,
                 onValueChange = { bodyDraft = it },
