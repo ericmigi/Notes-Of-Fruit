@@ -34,8 +34,12 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.CheckBox
+import androidx.compose.material.icons.filled.CheckBoxOutlineBlank
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -77,6 +81,10 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import android.content.Intent
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -110,7 +118,17 @@ private sealed interface ScreenState {
     data class Loading(val msg: String) : ScreenState
     data class Error(val msg: String) : ScreenState
     data class NotesList(val session: ICloudSession, val notes: List<NoteSummary>) : ScreenState
-    data class Detail(val session: ICloudSession, val record: NoteRecord) : ScreenState
+    /**
+     * Detail keeps the cached [notesCache] from the list view so back-nav
+     * restores the list instantly without a `fetchRecents` round trip.
+     * `notesCache` is updated in place when we save (replacing the just-saved
+     * note's summary) so the user sees the new snippet on return.
+     */
+    data class Detail(
+        val session: ICloudSession,
+        val record: NoteRecord,
+        val notesCache: List<NoteSummary>,
+    ) : ScreenState
 }
 
 @Composable
@@ -127,6 +145,7 @@ fun AppleNotesApp() {
     var saving by remember { mutableStateOf(false) }
     var ourReplicaUuid by remember { mutableStateOf<ByteArray?>(null) }
     var lastSavedHint by remember { mutableStateOf<String?>(null) }
+    var lastSavedAtMs by remember { mutableStateOf<Long?>(null) }
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(Unit) {
@@ -197,7 +216,7 @@ fun AppleNotesApp() {
                     state = ScreenState.Loading("Loading note…")
                     state = try {
                         val rec = AppleNotesClient(httpClient, s.session).lookupNote(note.recordName)
-                        ScreenState.Detail(s.session, rec)
+                        ScreenState.Detail(s.session, rec, s.notes)
                     } catch (e: Throwable) {
                         ScreenState.Error(e.message ?: e.toString())
                     }
@@ -213,6 +232,47 @@ fun AppleNotesApp() {
                     }
                 }
             },
+            onCreateNote = {
+                scope.launch {
+                    val uuid = ourReplicaUuid
+                    if (uuid == null) {
+                        state = ScreenState.Error("Device replica UUID not loaded yet — try again in a moment.")
+                        return@launch
+                    }
+                    state = ScreenState.Loading("Creating note…")
+                    state = try {
+                        val client = AppleNotesClient(httpClient, s.session)
+                        // Grab a Folder ref from any existing note (CloudKit
+                        // requires a CKReference to attach the new note to).
+                        val sample = s.notes.firstOrNull()
+                            ?: error("No existing note to copy folder reference from")
+                        val sampleRecord = client.lookupNote(sample.recordName)
+                        val folderRef = sampleRecord.rawFields["Folder"]
+                            ?: error("Sample note has no Folder field")
+                        // Create with empty title + body. The user types and
+                        // the first non-blank line becomes the title.
+                        val created = client.createNote(
+                            title = "",
+                            body = "",
+                            folderRef = folderRef,
+                            ourReplicaUuid = uuid,
+                        )
+                        // Pre-pend the new (empty) summary into the cache so
+                        // back-nav shows it immediately without a refetch.
+                        val newSummary = NoteSummary(
+                            recordName = created.recordName,
+                            title = null,
+                            snippet = null,
+                            modificationTimestampMs = System.currentTimeMillis(),
+                            deleted = false,
+                        )
+                        ScreenState.Detail(s.session, created, listOf(newSummary) + s.notes)
+                    } catch (e: Throwable) {
+                        Log.e(TAG, "createNote failed", e)
+                        ScreenState.Error(e.message ?: e.toString())
+                    }
+                }
+            },
             onSignOut = {
                 cookieReader.clearAuthCookies()
                 state = ScreenState.Login
@@ -222,19 +282,15 @@ fun AppleNotesApp() {
             record = s.record,
             saving = saving,
             savedHint = lastSavedHint,
+            lastSavedAtMs = lastSavedAtMs,
             onHintShown = { lastSavedHint = null },
             onBack = {
-                // Re-fetch list to pick up our edits
-                scope.launch {
-                    state = ScreenState.Loading("Loading…")
-                    state = try {
-                        ScreenState.NotesList(s.session, refreshList(s.session))
-                    } catch (e: Throwable) {
-                        ScreenState.Error(e.message ?: e.toString())
-                    }
-                }
+                // Restore the cached list instantly. No network round trip —
+                // `notesCache` was patched in place when we saved, so the snippet
+                // for the just-edited note already reflects our changes.
+                state = ScreenState.NotesList(s.session, s.notesCache)
             },
-            onSave = { newBody, isPureAppend ->
+            onSave = { newBody, isPureAppend, alsoExit ->
                 scope.launch {
                     saving = true
                     try {
@@ -279,8 +335,36 @@ fun AppleNotesApp() {
                             newSnippet = newSnippet.takeIf { it != oldSnippet },
                             replicaVersionPassThroughB64 = s.record.stringField("ReplicaIDToNotesVersionDataEncrypted"),
                         )
-                        state = ScreenState.Detail(s.session, updated)
-                        lastSavedHint = "Saved to iCloud. Mac users may need to quit & reopen Notes.app to see changes."
+                        // Patch the cached list summary for this note so when the
+                        // user navigates back they see the updated snippet/title
+                        // without a refetch.
+                        val patchedCache = s.notesCache.map { note ->
+                            if (note.recordName == s.record.recordName) {
+                                note.copy(
+                                    title = newTitle,
+                                    snippet = newSnippet,
+                                    modificationTimestampMs = System.currentTimeMillis(),
+                                )
+                            } else note
+                        }
+                        // Defensive state update: the save coroutine may complete
+                        // AFTER the user has navigated away (e.g. they tapped back,
+                        // we triggered a save+exit, save took 500ms, user is now
+                        // looking at the list). If the user is still on this same
+                        // Detail, refresh with the updated record. If they've
+                        // moved to NotesList, just patch its cache silently. Else
+                        // (Error, Splash, Login, different Detail), leave alone.
+                        val current = state
+                        state = when {
+                            current is ScreenState.Detail &&
+                                current.record.recordName == s.record.recordName ->
+                                if (alsoExit) ScreenState.NotesList(current.session, patchedCache)
+                                else ScreenState.Detail(current.session, updated, patchedCache)
+                            current is ScreenState.NotesList ->
+                                ScreenState.NotesList(current.session, patchedCache)
+                            else -> current
+                        }
+                        lastSavedAtMs = System.currentTimeMillis()
                     } catch (e: Throwable) {
                         Log.e(TAG, "save failed", e)
                         state = ScreenState.Error(e.message ?: e.toString())
@@ -296,8 +380,11 @@ fun AppleNotesApp() {
                         val tag = s.record.recordChangeTag
                             ?: error("No recordChangeTag — refresh first.")
                         AppleNotesClient(httpClient, s.session).deleteNote(s.record.recordName, tag)
-                        // back to list, refreshed
-                        ScreenState.NotesList(s.session, refreshList(s.session))
+                        // Drop the deleted note from the cache and return to list.
+                        ScreenState.NotesList(
+                            s.session,
+                            s.notesCache.filter { it.recordName != s.record.recordName },
+                        )
                     } catch (e: Throwable) {
                         Log.e(TAG, "delete failed", e)
                         ScreenState.Error(e.message ?: e.toString())
@@ -381,6 +468,7 @@ private fun NotesListScreen(
     notes: List<NoteSummary>,
     onSelect: (NoteSummary) -> Unit,
     onRefresh: () -> Unit,
+    onCreateNote: () -> Unit,
     onSignOut: () -> Unit,
 ) {
     var query by remember { mutableStateOf("") }
@@ -416,6 +504,15 @@ private fun NotesListScreen(
                 },
                 scrollBehavior = scrollBehavior,
             )
+        },
+        floatingActionButton = {
+            FloatingActionButton(
+                onClick = onCreateNote,
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary,
+            ) {
+                Icon(Icons.Default.Add, contentDescription = "New note")
+            }
         },
     ) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
@@ -482,7 +579,7 @@ private fun EmptyNotesState(filtering: Boolean) {
         if (!filtering) {
             Spacer(Modifier.height(4.dp))
             Text(
-                "Create one on Mac or iCloud.com — it'll show up here.",
+                "Tap + to create a note, or sync one from Mac or iCloud.com.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -582,12 +679,15 @@ internal fun computeTitleAndSnippet(body: String): Pair<String, String> {
 private fun NoteDetailScreen(
     record: NoteRecord,
     onBack: () -> Unit,
-    onSave: (newBody: String, isPureAppend: Boolean) -> Unit,
+    onSave: (newBody: String, isPureAppend: Boolean, alsoExit: Boolean) -> Unit,
     onDelete: () -> Unit,
     saving: Boolean,
     savedHint: String? = null,
+    lastSavedAtMs: Long? = null,
     onHintShown: () -> Unit = {},
 ) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val shareContext = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
     LaunchedEffect(savedHint) {
         if (savedHint != null) {
@@ -627,8 +727,66 @@ private fun NoteDetailScreen(
     }
     val fullBodyForSave = titlePrefix + bodyDraft
 
+    // Parse the note's attribute_runs once per record load. These define which
+    // visible chars belong to which paragraph style (bullet/checkbox/numbered/
+    // body). When the user edits, new chars get default body style; existing
+    // formatting is preserved unchanged in the proto (we don't yet emit new
+    // attribute_runs from edits — that's Phase D / editor toolbar).
+    val attrSpans = remember(record.recordName, record.recordChangeTag) {
+        record.stringField("TextDataEncrypted")?.let { b64 ->
+            runCatching { NoteBodyEditor.parseAttributeRunsFromBase64(b64) }.getOrNull()
+        }.orEmpty()
+    }
+    var editing by remember(record.recordName, record.recordChangeTag) {
+        mutableStateOf(false)
+    }
+
     var showDeleteDialog by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
+
+    // Auto-save on lifecycle ON_PAUSE (app backgrounded, screen turns off,
+    // another activity covers us, etc.). Best-effort fire-and-forget — the
+    // parent's onSave coroutine handles the actual network call. We pass
+    // `alsoExit=false` because we're not navigating, just persisting.
+    // Use `rememberUpdatedState` semantics by referencing the latest values
+    // through the captured composable scope.
+    DisposableEffect(lifecycleOwner, isModified, fullBodyForSave, isPureAppend) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE && isModified && !saving) {
+                onSave(fullBodyForSave, isPureAppend, false)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // "Saved Xs ago" pill — recompute every 10s.
+    var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(lastSavedAtMs) {
+        while (lastSavedAtMs != null) {
+            nowMs = System.currentTimeMillis()
+            kotlinx.coroutines.delay(10_000)
+        }
+    }
+    val savedAgoText: String? = lastSavedAtMs?.let { savedAt ->
+        val deltaSec = (nowMs - savedAt) / 1000
+        when {
+            deltaSec < 5 -> "Saved"
+            deltaSec < 60 -> "Saved ${deltaSec}s ago"
+            deltaSec < 3600 -> "Saved ${deltaSec / 60}m ago"
+            else -> "Saved ${deltaSec / 3600}h ago"
+        }
+    }
+
+    val onBackOrSave: () -> Unit = {
+        if (isModified && !saving) {
+            // Save and navigate atomically. Parent handles the navigation in
+            // the save's success callback (sees alsoExit=true).
+            onSave(fullBodyForSave, isPureAppend, true)
+        } else {
+            onBack()
+        }
+    }
 
     Scaffold(
         modifier = Modifier.imePadding(),
@@ -637,19 +795,61 @@ private fun NoteDetailScreen(
             Column {
                 TopAppBar(
                     navigationIcon = {
-                        IconButton(onClick = onBack) {
+                        IconButton(onClick = onBackOrSave) {
                             Icon(Icons.AutoMirrored.Default.ArrowBack, contentDescription = "Back")
                         }
                     },
-                    title = { Text(titleForBar, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    title = {
+                        Column {
+                            Text(titleForBar, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            val pill = when {
+                                saving -> "Saving…"
+                                isModified -> "Unsaved"
+                                savedAgoText != null -> savedAgoText
+                                else -> null
+                            }
+                            if (pill != null) {
+                                Text(
+                                    pill,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                )
+                            }
+                        }
+                    },
                     actions = {
                         if (isModified) {
                             IconButton(
                                 enabled = !saving,
-                                onClick = { onSave(fullBodyForSave, isPureAppend) },
+                                onClick = { onSave(fullBodyForSave, isPureAppend, false) },
                             ) {
                                 Icon(Icons.Default.Check, contentDescription = "Save")
                             }
+                        }
+                        if (!editing) {
+                            IconButton(onClick = { editing = true }) {
+                                Icon(Icons.Default.Edit, contentDescription = "Edit")
+                            }
+                        }
+                        IconButton(
+                            onClick = {
+                                // Share the visible body (title + content) as
+                                // plaintext via Android's standard chooser.
+                                val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                                    type = "text/plain"
+                                    putExtra(Intent.EXTRA_TEXT, fullBodyForSave)
+                                    titleForBar.takeIf { it != "(untitled)" }?.let {
+                                        putExtra(Intent.EXTRA_SUBJECT, it)
+                                    }
+                                }
+                                val chooser = Intent.createChooser(sendIntent, null).apply {
+                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                }
+                                shareContext.startActivity(chooser)
+                            },
+                        ) {
+                            Icon(Icons.Default.Share, contentDescription = "Share")
                         }
                         IconButton(onClick = { menuOpen = true }) {
                             Icon(Icons.Default.MoreVert, contentDescription = "More")
@@ -672,30 +872,42 @@ private fun NoteDetailScreen(
         Column(
             modifier = Modifier.fillMaxSize().padding(padding),
         ) {
-            BasicTextField(
-                value = bodyDraft,
-                onValueChange = { bodyDraft = it },
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 16.dp),
-                textStyle = MaterialTheme.typography.bodyLarge.copy(
-                    color = MaterialTheme.colorScheme.onSurface,
-                ),
-                cursorBrush = androidx.compose.ui.graphics.SolidColor(MaterialTheme.colorScheme.primary),
-                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
-                decorationBox = { inner ->
-                    if (bodyDraft.isEmpty()) {
-                        Text(
-                            "Start typing…",
-                            style = MaterialTheme.typography.bodyLarge.copy(
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            ),
-                        )
-                    }
-                    inner()
-                },
-            )
+            if (editing) {
+                BasicTextField(
+                    value = bodyDraft,
+                    onValueChange = { bodyDraft = it },
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp, vertical = 16.dp),
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(
+                        color = MaterialTheme.colorScheme.onSurface,
+                    ),
+                    cursorBrush = androidx.compose.ui.graphics.SolidColor(MaterialTheme.colorScheme.primary),
+                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                    decorationBox = { inner ->
+                        if (bodyDraft.isEmpty()) {
+                            Text(
+                                "Start typing…",
+                                style = MaterialTheme.typography.bodyLarge.copy(
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                ),
+                            )
+                        }
+                        inner()
+                    },
+                )
+            } else {
+                FormattedNoteBody(
+                    fullBody = fullBodyForSave,
+                    titlePrefixLength = titlePrefix.length,
+                    attrSpans = attrSpans,
+                    onTap = { editing = true },
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                )
+            }
             // Footer: modification date + char count + chord guidance.
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             Row(
@@ -734,5 +946,198 @@ private fun NoteDetailScreen(
                 TextButton(onClick = { showDeleteDialog = false }) { Text("Cancel") }
             },
         )
+    }
+}
+
+/**
+ * Formatted preview of a note's body. Walks the visible text paragraph by
+ * paragraph, applies the matching attribute_run style (body / bullet /
+ * checkbox / numbered / heading / title), and renders each paragraph as
+ * a styled Text or Row composable. Title (the first line) is rendered as
+ * a large heading; subsequent lines get their own attribute-run style.
+ *
+ * Tap anywhere to switch the screen into the plain-text editor.
+ */
+@Composable
+private fun FormattedNoteBody(
+    fullBody: String,
+    titlePrefixLength: Int,
+    attrSpans: List<NoteBodyEditor.AttrSpan>,
+    onTap: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    // Map each char index -> (style, checked). Walk attrSpans in order and
+    // assign each char its span's style. Total span lengths usually match
+    // fullBody.length; if they don't (which can happen if Apple emits trailing
+    // ARs covering chars we don't render), we tolerate the mismatch by
+    // clamping.
+    val styleAt = remember(fullBody, attrSpans) {
+        val arr = arrayOfNulls<NoteBodyEditor.AttrSpan>(fullBody.length)
+        var pos = 0
+        for (span in attrSpans) {
+            val end = (pos + span.length).coerceAtMost(fullBody.length)
+            for (i in pos until end) arr[i] = span
+            pos = end
+            if (pos >= fullBody.length) break
+        }
+        arr
+    }
+
+    // Split into paragraphs. Each paragraph is the chars between consecutive
+    // newlines (the newline goes WITH its preceding paragraph).
+    val paragraphs = remember(fullBody) {
+        val out = mutableListOf<IntRange>()
+        var start = 0
+        for ((i, c) in fullBody.withIndex()) {
+            if (c == '\n') {
+                out.add(start..i)
+                start = i + 1
+            }
+        }
+        if (start < fullBody.length) out.add(start until fullBody.length)
+        else if (start == fullBody.length && fullBody.endsWith('\n')) {
+            out.add(start until start) // trailing empty paragraph
+        }
+        out
+    }
+
+    Column(
+        modifier = modifier
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 16.dp)
+            .clickable(onClick = onTap),
+    ) {
+        var listCounter = 0
+        var lastListStyle: NoteBodyEditor.ParagraphStyle? = null
+        for (range in paragraphs) {
+            val rawText = fullBody.substring(range.first, range.last + 1).trimEnd('\n')
+            // The dominant style of a paragraph = the style of its first char.
+            val firstStyle = if (range.first < styleAt.size) styleAt[range.first] else null
+            // Treat the very first paragraph (the title line) as TITLE if we
+            // haven't seen a TITLE attribute_run already.
+            val effectiveStyle = when {
+                range.first < titlePrefixLength -> NoteBodyEditor.ParagraphStyle.TITLE
+                firstStyle != null -> firstStyle.style
+                else -> NoteBodyEditor.ParagraphStyle.BODY
+            }
+            // Reset numbered-list counter when the previous para wasn't the
+            // same numbered list.
+            if (effectiveStyle != NoteBodyEditor.ParagraphStyle.NUMBERED_LIST) {
+                listCounter = 0
+            }
+            lastListStyle = effectiveStyle
+
+            when (effectiveStyle) {
+                NoteBodyEditor.ParagraphStyle.TITLE -> {
+                    if (rawText.isNotEmpty()) {
+                        Text(
+                            rawText,
+                            style = MaterialTheme.typography.headlineLarge.copy(
+                                fontWeight = FontWeight.Bold,
+                            ),
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.padding(bottom = 8.dp),
+                        )
+                    }
+                }
+                NoteBodyEditor.ParagraphStyle.HEADING -> {
+                    Text(
+                        rawText,
+                        style = MaterialTheme.typography.headlineMedium.copy(
+                            fontWeight = FontWeight.SemiBold,
+                        ),
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.padding(top = 8.dp, bottom = 4.dp),
+                    )
+                }
+                NoteBodyEditor.ParagraphStyle.SUBHEADING -> {
+                    Text(
+                        rawText,
+                        style = MaterialTheme.typography.titleMedium.copy(
+                            fontWeight = FontWeight.SemiBold,
+                        ),
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.padding(top = 6.dp, bottom = 2.dp),
+                    )
+                }
+                NoteBodyEditor.ParagraphStyle.MONOSPACED -> {
+                    Text(
+                        rawText,
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                        ),
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                }
+                NoteBodyEditor.ParagraphStyle.BULLETED_LIST -> {
+                    Row(verticalAlignment = Alignment.Top) {
+                        Text(
+                            "•  ",
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            rawText,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
+                }
+                NoteBodyEditor.ParagraphStyle.CHECKBOX_LIST -> {
+                    val checked = firstStyle?.checked ?: false
+                    Row(verticalAlignment = Alignment.Top) {
+                        Icon(
+                            if (checked) Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,
+                            contentDescription = if (checked) "Checked" else "Unchecked",
+                            tint = if (checked) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier
+                                .padding(end = 8.dp, top = 2.dp)
+                                .height(20.dp),
+                        )
+                        Text(
+                            rawText,
+                            style = MaterialTheme.typography.bodyLarge.copy(
+                                color = if (checked) MaterialTheme.colorScheme.onSurfaceVariant
+                                    else MaterialTheme.colorScheme.onSurface,
+                            ),
+                        )
+                    }
+                }
+                NoteBodyEditor.ParagraphStyle.NUMBERED_LIST -> {
+                    listCounter++
+                    Row(verticalAlignment = Alignment.Top) {
+                        Text(
+                            "$listCounter.  ",
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            rawText,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
+                }
+                NoteBodyEditor.ParagraphStyle.BODY -> {
+                    if (rawText.isEmpty()) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                    } else {
+                        Text(
+                            rawText,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
+                }
+            }
+        }
+        if (paragraphs.isEmpty()) {
+            Text(
+                "Start typing…",
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }

@@ -971,13 +971,94 @@ object NoteAppender {
             )
         }
 
-        // Compose the new stringFields list:
-        //   field 2 (string)         -- replace payload with newFlat bytes
-        //   field 3 (substring)*     -- newSubstringFields (in chain order)
-        //   field 4 (timestamp)      -- vtFields (already rebuilt)
-        //   field 5 (attribute_run)+ -- single run with length = newFlat.length, font from last existing
+        // ===== Preserve attribute_runs across the splice =====
+        //
+        // Naive: emit ONE body-styled AR covering all chars (loses headings,
+        // bullets, checkboxes, every paragraph's f9 UUID).
+        // Correct: keep the original AR for each char that survives the
+        // splice (prefix + suffix), emit a default-body AR for the inserted
+        // middle. Run-length-encode consecutive same-source chars into ARs.
+        //
+        // For each char in `currentVisible` we know its origin AR (cumulative
+        // walk over original AR lengths). For each char in the new body, we
+        // know whether it came from the prefix, the insert, or the suffix
+        // (computed earlier). Map new chars → origin AR, then emit ARs.
+        val origARFields = stringFields.filter {
+            it.fieldNumber == FIELD_STRING_ATTRIBUTE_RUN && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        val origARLengths = origARFields.map { ar ->
+            val arf = ProtobufWire.decode(ar.payload)
+            val len = arf.firstOrNull {
+                it.fieldNumber == FIELD_ATTR_LENGTH && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it).toInt() } ?: 0
+            len
+        }
+        // origCharAR[i] = index into origARFields for the original visible
+        // char at position i, or -1 if past the AR coverage (Apple's AR
+        // lengths usually total visible.length but we tolerate mismatch).
+        val origCharAR = IntArray(currentVisible.length) { -1 }
+        run {
+            var p = 0
+            for ((arIdx, len) in origARLengths.withIndex()) {
+                val end = (p + len).coerceAtMost(currentVisible.length)
+                for (i in p until end) origCharAR[i] = arIdx
+                p = end
+                if (p >= currentVisible.length) break
+            }
+        }
+        // newCharAR[i] = origARFields index for char i of the new body, or -1
+        // for "this char is newly inserted, give it default body style".
+        val newCharAR = IntArray(newFullBody.length) { -1 }
+        for (i in 0 until prefixLen.coerceAtMost(currentVisible.length)) {
+            newCharAR[i] = origCharAR[i]
+        }
+        // Suffix chars: come from the END of currentVisible.
+        val newSuffixStart = newFullBody.length - suffixLen
+        for (i in 0 until suffixLen) {
+            val origIdx = currentVisible.length - suffixLen + i
+            if (origIdx in origCharAR.indices) {
+                newCharAR[newSuffixStart + i] = origCharAR[origIdx]
+            }
+        }
+        // The middle chars (if any insertion) keep the default -1.
+
+        // Run-length encode consecutive same-source chars into ARs. For -1
+        // (newly inserted), emit a default body AR using the template font of
+        // the last existing AR (matches the look of typing into a body region).
         val templateFont = lastAttributeRunFont(stringFields)
-        val newAttrRun = buildAttributeRun(length = newFlat.length, fontFields = templateFont)
+        val newARs = ArrayList<ProtobufWire.Field>()
+        var runStart = 0
+        while (runStart < newFullBody.length) {
+            val src = newCharAR[runStart]
+            var runEnd = runStart + 1
+            while (runEnd < newFullBody.length && newCharAR[runEnd] == src) runEnd++
+            val len = runEnd - runStart
+            if (src >= 0) {
+                // Copy the original AR's bytes, replace its length field.
+                val origPayload = origARFields[src].payload
+                val arFields = ProtobufWire.decode(origPayload).toMutableList()
+                val li = arFields.indexOfFirst {
+                    it.fieldNumber == FIELD_ATTR_LENGTH && it.wireType == ProtobufWire.WIRE_VARINT
+                }
+                if (li >= 0) {
+                    arFields[li] = ProtobufWire.encodeVarintField(FIELD_ATTR_LENGTH, len.toLong())
+                } else {
+                    arFields.add(0, ProtobufWire.encodeVarintField(FIELD_ATTR_LENGTH, len.toLong()))
+                }
+                newARs.add(
+                    ProtobufWire.Field(
+                        FIELD_STRING_ATTRIBUTE_RUN,
+                        ProtobufWire.WIRE_LENGTH_DELIM,
+                        ProtobufWire.encode(arFields),
+                    ),
+                )
+            } else {
+                newARs.add(buildAttributeRun(length = len, fontFields = templateFont))
+            }
+            runStart = runEnd
+        }
+        Log.i(TAG, "splice attribute_runs: orig=${origARFields.size} new=${newARs.size} " +
+                "(prefix=$prefixLen insert=${insertText.length} suffix=$suffixLen)")
 
         val rebuiltStringFields = ArrayList<ProtobufWire.Field>()
         rebuiltStringFields.add(
@@ -995,7 +1076,7 @@ object NoteAppender {
                 ProtobufWire.encode(vtFields),
             ),
         )
-        rebuiltStringFields.add(newAttrRun)
+        rebuiltStringFields.addAll(newARs)
         // Preserve any other fields we don't touch (e.g., attachments at field 6).
         for (f in stringFields) {
             when (f.fieldNumber) {

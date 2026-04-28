@@ -863,4 +863,103 @@ object NoteBodyEditor {
         }
         return high.code
     }
+
+    // ---------- Attribute-run paragraph style decoding ----------
+    //
+    // Apple Notes encodes per-character formatting in `attribute_run` entries
+    // (field 5 of the topotext.String / Note message). Each entry has:
+    //
+    //   message AttributeRun {
+    //     int32 length            = 1;  // chars covered (UTF-16 code units)
+    //     ParagraphStyle style    = 2;  // nested style msg
+    //     int64 timestamp         = 13; // creation timestamp
+    //   }
+    //   message ParagraphStyle {
+    //     int32 styleType         = 1;  // OUR `paragraphStyle` enum
+    //     int32 indent            = 2;  // (mostly absent)
+    //     int32 fontVariant       = 3;  // (1 in observed notes)
+    //     int32 checked           = 4;  // checkbox state (only for CHECKBOX style)
+    //     bytes paragraphUuid     = 9;  // 16-byte UUID identifying the paragraph
+    //   }
+    //
+    // styleType codes observed across the user's library:
+    //   0 (or absent) = BODY (default body text)
+    //   1             = TITLE (only seen at the start of "Terminology")
+    //   100           = BULLETED_LIST (•)
+    //   101           = CHECKBOX_LIST (☐ / ☑ via `checked`)
+    //   102           = NUMBERED_LIST (1.)
+    // (Headings 2/3 / monospaced 4 not observed in this library; tolerate them
+    // when found by treating styleType as ParagraphStyle directly.)
+
+    enum class ParagraphStyle(val code: Int) {
+        BODY(0),
+        TITLE(1),
+        HEADING(2),
+        SUBHEADING(3),
+        MONOSPACED(4),
+        BULLETED_LIST(100),
+        CHECKBOX_LIST(101),
+        NUMBERED_LIST(102);
+        companion object {
+            fun fromCode(c: Int): ParagraphStyle = values().firstOrNull { it.code == c } ?: BODY
+        }
+    }
+
+    /**
+     * One contiguous attribute-run span. `length` is the number of visible
+     * chars this span covers (in tree-walk order, matching the visible text
+     * returned by [readVisibleText]). The spans are returned in order; their
+     * lengths sum to the visible text length (modulo Apple bugs).
+     */
+    data class AttrSpan(
+        val length: Int,
+        val style: ParagraphStyle,
+        val checked: Boolean,
+    )
+
+    fun parseAttributeRuns(noteStoreProtoBytes: ByteArray): List<AttrSpan> = runCatching {
+        val top = ProtobufWire.decode(noteStoreProtoBytes)
+        val docField = top.firstOrNull {
+            it.fieldNumber == FIELD_NOTESTOREPROTO_DOCUMENT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        } ?: return@runCatching emptyList<AttrSpan>()
+        val docFields = ProtobufWire.decode(docField.payload)
+        val noteField = docFields.firstOrNull {
+            it.fieldNumber == FIELD_DOCUMENT_NOTE && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        } ?: return@runCatching emptyList<AttrSpan>()
+        val noteFields = ProtobufWire.decode(noteField.payload)
+        val FIELD_AR = 5
+        val FIELD_AR_LENGTH = 1
+        val FIELD_AR_STYLE = 2
+        val FIELD_PS_STYLETYPE = 1
+        val FIELD_PS_CHECKED = 4
+        val out = ArrayList<AttrSpan>()
+        for (f in noteFields) {
+            if (f.fieldNumber != FIELD_AR || f.wireType != ProtobufWire.WIRE_LENGTH_DELIM) continue
+            val arFields = ProtobufWire.decode(f.payload)
+            val length = arFields.firstOrNull {
+                it.fieldNumber == FIELD_AR_LENGTH && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it).toInt() } ?: 0
+            val styleField = arFields.firstOrNull {
+                it.fieldNumber == FIELD_AR_STYLE && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }
+            var styleCode = 0
+            var checked = false
+            if (styleField != null) {
+                val ps = ProtobufWire.decode(styleField.payload)
+                styleCode = ps.firstOrNull {
+                    it.fieldNumber == FIELD_PS_STYLETYPE && it.wireType == ProtobufWire.WIRE_VARINT
+                }?.let { ProtobufWire.decodeVarint(it).toInt() } ?: 0
+                checked = (ps.firstOrNull {
+                    it.fieldNumber == FIELD_PS_CHECKED && it.wireType == ProtobufWire.WIRE_VARINT
+                }?.let { ProtobufWire.decodeVarint(it) } ?: 0L) != 0L
+            }
+            out.add(AttrSpan(length, ParagraphStyle.fromCode(styleCode), checked))
+        }
+        out
+    }.getOrElse { emptyList() }
+
+    fun parseAttributeRunsFromBase64(textDataEncryptedB64: String): List<AttrSpan> {
+        val compressed = Base64.decode(textDataEncryptedB64)
+        return parseAttributeRuns(Gzip.decompress(compressed))
+    }
 }
