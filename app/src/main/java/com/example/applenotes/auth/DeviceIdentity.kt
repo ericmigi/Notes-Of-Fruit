@@ -22,17 +22,47 @@ private val Context.deviceIdentityStore by preferencesDataStore("device_identity
  * Apple's per-note replica cap (and explode the registry size).
  */
 object DeviceIdentity {
-    private val UUID_KEY = stringPreferencesKey("replica_uuid_hex")
+    // Old storage key held a raw-random UUID — byte 6's version nibble was
+    // whatever SecureRandom produced (often NOT the 0x4 required for a v4
+    // UUID per RFC 4122). Apple's clients (iCloud.com, Mac, iOS) all
+    // produce properly-formatted v4 UUIDs, and we observed Mac's notesync
+    // trashing records whose sole replica had a non-v4 UUID (e.g. our
+    // accidentally-v3 UUID `632dbf57-3ba1-3699-...`). Bumping the storage
+    // key forces every install to mint a fresh, properly-formatted UUID.
+    // Old Android-created notes referencing the old UUID are already
+    // doomed (already in Recently Deleted on Mac); no migration needed.
+    private val UUID_KEY = stringPreferencesKey("replica_uuid_v4_hex")
 
     suspend fun getOrCreate(context: Context): ByteArray {
         val store = context.applicationContext.deviceIdentityStore
         val existing = store.data.first()[UUID_KEY]
         if (existing != null && existing.length == 32) {
-            return hexDecode(existing)
+            val bytes = hexDecode(existing)
+            if (isValidV4(bytes)) return bytes
+            // Stored UUID isn't valid v4 — regenerate.
         }
-        val fresh = ByteArray(16).also { SecureRandom().nextBytes(it) }
+        val fresh = generateV4Uuid()
         store.edit { it[UUID_KEY] = hexEncode(fresh) }
         return fresh
+    }
+
+    /**
+     * Generate a properly-formatted v4 (random) UUID per RFC 4122 §4.4.
+     * Sets byte 6's high nibble to 0x4 (version=4) and byte 8's high two
+     * bits to 0b10 (variant=DCE/RFC 4122). Apple Notes requires v4.
+     */
+    private fun generateV4Uuid(): ByteArray {
+        val bytes = ByteArray(16).also { SecureRandom().nextBytes(it) }
+        bytes[6] = ((bytes[6].toInt() and 0x0F) or 0x40).toByte()  // version = 4
+        bytes[8] = ((bytes[8].toInt() and 0x3F) or 0x80).toByte()  // variant = 10
+        return bytes
+    }
+
+    private fun isValidV4(bytes: ByteArray): Boolean {
+        if (bytes.size != 16) return false
+        val versionNibble = (bytes[6].toInt() ushr 4) and 0x0F
+        val variantBits = (bytes[8].toInt() ushr 6) and 0x03
+        return versionNibble == 4 && variantBits == 0b10
     }
 
     fun hexEncode(b: ByteArray): String =
