@@ -391,23 +391,14 @@ class AppleNotesClient(
                                 put("type", "TIMESTAMP")
                                 put("value", nowMs)
                             })
-                            // The remaining fields a Mac-created note has —
-                            // mirror them so the new record looks identical
-                            // to what Mac would produce. INT64=0 means "use
-                            // the default": no special paper, default
-                            // attachment view, not deleted.
-                            put("PaperStyleType", buildJsonObject {
-                                put("type", "INT64")
-                                put("value", 0)
-                            })
-                            put("AttachmentViewType", buildJsonObject {
-                                put("type", "INT64")
-                                put("value", 0)
-                            })
-                            put("Deleted", buildJsonObject {
-                                put("type", "INT64")
-                                put("value", 0)
-                            })
+                            // PaperStyleType / AttachmentViewType / Deleted /
+                            // Folders / FoldersModificationDate are
+                            // server-derived or default-zero — iCloud.com
+                            // doesn't send them on create and Mac fills them
+                            // in via notesync. Sending zeros made the record
+                            // look "edited" relative to defaults, which can
+                            // race the post-merge recordChangeTag bump and
+                            // cause CONFLICT on the very next edit.
                         })
                     })
                 })
@@ -455,65 +446,107 @@ class AppleNotesClient(
         // duplication after Android append on multi-substring typed notes).
         replicaVersionPassThroughB64: String? = null,
     ): NoteRecord {
-        val payload: JsonObject = buildJsonObject {
-            put("zoneID", buildJsonObject { put("zoneName", "Notes") })
-            putJsonArray("operations") {
-                add(buildJsonObject {
-                    put("operationType", "update")
-                    put("record", buildJsonObject {
-                        put("recordName", recordName)
-                        put("recordType", "Note")
-                        put("recordChangeTag", recordChangeTag)
-                        put("fields", buildJsonObject {
-                            put("TextDataEncrypted", buildJsonObject {
-                                put("type", "ENCRYPTED_BYTES")
-                                put("value", newTextDataEncryptedB64)
-                            })
-                            if (newTitle != null) {
-                                put("TitleEncrypted", buildJsonObject {
-                                    put("type", "ENCRYPTED_STRING")
-                                    put("value", kotlin.io.encoding.Base64.encode(newTitle.encodeToByteArray()))
-                                })
-                            }
-                            if (newSnippet != null) {
-                                put("SnippetEncrypted", buildJsonObject {
-                                    put("type", "ENCRYPTED_STRING")
-                                    put("value", kotlin.io.encoding.Base64.encode(newSnippet.encodeToByteArray()))
-                                })
-                            }
-                            if (replicaVersionPassThroughB64 != null) {
-                                put("ReplicaIDToNotesVersionDataEncrypted", buildJsonObject {
+        // Try once with the caller's tag; on CONFLICT (oplock — Mac's
+        // notesync silently bumped the tag after merging the previous
+        // op) re-lookup to get a fresh tag + replicaVersion, then retry
+        // once more. Two attempts max so we never loop on a real bug.
+        //
+        // KNOWN LIMITATION: this retry refreshes only the tag, not the
+        // base body. If a real concurrent edit happened between the
+        // caller's base lookup and this retry, we'll overwrite it with
+        // bytes computed against the stale base (last-writer-wins).
+        // The dominant case we hit is post-create housekeeping where
+        // Mac bumps the tag without changing user-visible text, which
+        // is safe. A proper fix is to bubble the conflict to the
+        // splice caller so it can re-splice against the fresh base.
+        var attempt = 0
+        var tag = recordChangeTag
+        var replicaB64 = replicaVersionPassThroughB64
+        while (true) {
+            attempt++
+            val payload: JsonObject = buildJsonObject {
+                put("zoneID", buildJsonObject { put("zoneName", "Notes") })
+                putJsonArray("operations") {
+                    add(buildJsonObject {
+                        put("operationType", "update")
+                        put("record", buildJsonObject {
+                            put("recordName", recordName)
+                            put("recordType", "Note")
+                            put("recordChangeTag", tag)
+                            put("fields", buildJsonObject {
+                                put("TextDataEncrypted", buildJsonObject {
                                     put("type", "ENCRYPTED_BYTES")
-                                    put("value", replicaVersionPassThroughB64)
+                                    put("value", newTextDataEncryptedB64)
                                 })
-                            }
+                                if (newTitle != null) {
+                                    put("TitleEncrypted", buildJsonObject {
+                                        put("type", "ENCRYPTED_STRING")
+                                        put("value", kotlin.io.encoding.Base64.encode(newTitle.encodeToByteArray()))
+                                    })
+                                }
+                                if (newSnippet != null) {
+                                    put("SnippetEncrypted", buildJsonObject {
+                                        put("type", "ENCRYPTED_STRING")
+                                        put("value", kotlin.io.encoding.Base64.encode(newSnippet.encodeToByteArray()))
+                                    })
+                                }
+                                if (replicaB64 != null) {
+                                    put("ReplicaIDToNotesVersionDataEncrypted", buildJsonObject {
+                                        put("type", "ENCRYPTED_BYTES")
+                                        put("value", replicaB64)
+                                    })
+                                }
+                            })
                         })
                     })
-                })
+                }
             }
+            Log.i(
+                TAG,
+                "modifyNoteBody[a$attempt]: rec=$recordName tag=$tag b64.len=${newTextDataEncryptedB64.length} " +
+                    "title=${newTitle?.let { "'${it.take(40)}'" } ?: "<unchanged>"} " +
+                    "snippet=${newSnippet?.let { "'${it.take(40)}'" } ?: "<unchanged>"}",
+            )
+            Log.i(TAG, "modifyNoteBody SENT proto: ${NoteBodyEditor.summarizeBase64(newTextDataEncryptedB64)}")
+            val t0 = System.currentTimeMillis()
+            val (status, raw) = postJson("/records/modify", payload)
+            val elapsed = System.currentTimeMillis() - t0
+            Log.i(TAG, "modifyNoteBody response: HTTP $status, ${raw.length}B in ${elapsed}ms")
+            Log.i(TAG, "modifyNoteBody response body[0..600]=${raw.take(600)}")
+            if (status !in 200..299) {
+                Log.e(TAG, "modifyNoteBody FAILED body=${raw.take(800)}")
+                error("CloudKit records/modify HTTP $status: ${raw.take(800)}")
+            }
+            val parsed = LENIENT_JSON.decodeFromString(QueryResponse.serializer(), raw)
+            val rec = parsed.records?.firstOrNull() ?: error("records/modify returned no record")
+            val serverErr = rec.serverErrorCode
+            if (serverErr != null) {
+                val isConflict = serverErr == "CONFLICT" ||
+                    (rec.reason?.contains("oplock", ignoreCase = true) == true)
+                if (isConflict && attempt == 1) {
+                    Log.w(TAG, "modifyNoteBody CONFLICT (oplock) — refetching tag and retrying. reason=${rec.reason}")
+                    val fresh = lookupNote(recordName)
+                    val newTag = fresh.recordChangeTag
+                        ?: error("modifyNoteBody refetch returned no recordChangeTag for $recordName")
+                    tag = newTag
+                    replicaB64 = fresh.stringField("ReplicaIDToNotesVersionDataEncrypted") ?: replicaB64
+                    Log.i(TAG, "modifyNoteBody retry with fresh tag=$tag")
+                    continue
+                }
+                Log.e(TAG, "modifyNoteBody per-record error: $serverErr reason=${rec.reason}")
+                error("modifyNoteBody per-record error: $serverErr reason=${rec.reason ?: "?"}")
+            }
+            // Success — fall through to record handling below.
+            return finishModifyNoteBody(recordName, rec, newTextDataEncryptedB64)
         }
-        Log.i(
-            TAG,
-            "modifyNoteBody: rec=$recordName tag=$recordChangeTag b64.len=${newTextDataEncryptedB64.length} " +
-                "title=${newTitle?.let { "'${it.take(40)}'" } ?: "<unchanged>"} " +
-                "snippet=${newSnippet?.let { "'${it.take(40)}'" } ?: "<unchanged>"}",
-        )
-        Log.i(TAG, "modifyNoteBody SENT proto: ${NoteBodyEditor.summarizeBase64(newTextDataEncryptedB64)}")
-        val t0 = System.currentTimeMillis()
-        val (status, raw) = postJson("/records/modify", payload)
-        val elapsed = System.currentTimeMillis() - t0
-        Log.i(TAG, "modifyNoteBody response: HTTP $status, ${raw.length}B in ${elapsed}ms")
-        Log.i(TAG, "modifyNoteBody response body[0..600]=${raw.take(600)}")
-        if (status !in 200..299) {
-            Log.e(TAG, "modifyNoteBody FAILED body=${raw.take(800)}")
-            error("CloudKit records/modify HTTP $status: ${raw.take(800)}")
-        }
-        val parsed = LENIENT_JSON.decodeFromString(QueryResponse.serializer(), raw)
-        val rec = parsed.records?.firstOrNull() ?: error("records/modify returned no record")
-        rec.serverErrorCode?.let { code ->
-            Log.e(TAG, "modifyNoteBody per-record error: $code reason=${rec.reason}")
-            error("modifyNoteBody per-record error: $code reason=${rec.reason ?: "?"}")
-        }
+    }
+
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+    private suspend fun finishModifyNoteBody(
+        recordName: String,
+        rec: RecordSummary,
+        newTextDataEncryptedB64: String,
+    ): NoteRecord {
         val record = NoteRecord(
             recordName = rec.recordName ?: recordName,
             recordType = rec.recordType,

@@ -466,7 +466,7 @@ private fun CenteredSpinner(msg: String) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ErrorScreen(message: String, onRetry: () -> Unit, onSignOut: () -> Unit) {
-    Scaffold(topBar = { TopAppBar(title = { Text("Apple Notes") }) }) { padding ->
+    Scaffold(topBar = { TopAppBar(title = { Text("Notes of Fruit") }) }) { padding ->
         Column(
             modifier = Modifier.fillMaxSize().padding(padding).padding(20.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
