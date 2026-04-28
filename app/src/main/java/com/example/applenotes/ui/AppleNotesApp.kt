@@ -140,7 +140,7 @@ fun AppleNotesApp() {
 
     suspend fun bootstrap(): ScreenState = try {
         val session = AppleNotesSession(httpClient, cookieReader).bootstrap().getOrThrow()
-        val notes = AppleNotesClient(httpClient, session).fetchRecents(limit = 100)
+        val notes = AppleNotesClient(httpClient, session).fetchRecents(limit = 1000)
             .filter { !it.deleted }
             .sortedByDescending { it.modificationTimestampMs ?: 0L }
         ScreenState.NotesList(session, notes)
@@ -150,7 +150,7 @@ fun AppleNotesApp() {
     }
 
     suspend fun refreshList(session: ICloudSession): List<NoteSummary> =
-        AppleNotesClient(httpClient, session).fetchRecents(100)
+        AppleNotesClient(httpClient, session).fetchRecents(limit = 1000)
             .filter { !it.deleted }
             .sortedByDescending { it.modificationTimestampMs ?: 0L }
 
@@ -601,14 +601,31 @@ private fun NoteDetailScreen(
                 ?: runCatching { NoteBodyEditor.readTextFromBase64(b64) }.getOrNull()
         }.orEmpty()
     }
+    // Apple Notes stores the title as the first line of the body. The Mac and
+    // iCloud.com renderers display it once (in the title position). Our UI
+    // shows it in the top app bar — so strip the title line + its trailing
+    // newline from the body editor to avoid showing it twice. The original
+    // titlePrefix is stitched back on when we save, so the underlying body
+    // shape stays identical to what Mac expects.
+    val titlePrefix = remember(originalBody) {
+        val firstNl = originalBody.indexOf('\n')
+        when {
+            originalBody.isEmpty() -> ""
+            firstNl < 0 -> originalBody // whole body is one line — treat as title
+            else -> originalBody.substring(0, firstNl + 1)
+        }
+    }
+    val titleForBar = titlePrefix.trimEnd('\n').takeIf { it.isNotBlank() } ?: "(untitled)"
+    val originalBodyAfterTitle = originalBody.removePrefix(titlePrefix)
     var bodyDraft by remember(record.recordName, record.recordChangeTag) {
-        mutableStateOf(originalBody)
+        mutableStateOf(originalBodyAfterTitle)
     }
-    val isModified = bodyDraft != originalBody
-    val isPureAppend = remember(bodyDraft, originalBody) {
-        bodyDraft.startsWith(originalBody) && bodyDraft.length > originalBody.length
+    val isModified = bodyDraft != originalBodyAfterTitle
+    val isPureAppend = remember(bodyDraft, originalBodyAfterTitle) {
+        bodyDraft.startsWith(originalBodyAfterTitle) &&
+            bodyDraft.length > originalBodyAfterTitle.length
     }
-    val titleForBar = bodyDraft.lineSequence().firstOrNull()?.takeIf { it.isNotBlank() } ?: "(untitled)"
+    val fullBodyForSave = titlePrefix + bodyDraft
 
     var showDeleteDialog by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
@@ -629,7 +646,7 @@ private fun NoteDetailScreen(
                         if (isModified) {
                             IconButton(
                                 enabled = !saving,
-                                onClick = { onSave(bodyDraft, isPureAppend) },
+                                onClick = { onSave(fullBodyForSave, isPureAppend) },
                             ) {
                                 Icon(Icons.Default.Check, contentDescription = "Save")
                             }

@@ -60,55 +60,75 @@ class AppleNotesClient(
     private val session: ICloudSession,
 ) {
     suspend fun fetchRecents(limit: Int = 50): List<NoteSummary> {
-        val payload: JsonObject = buildJsonObject {
-            put("zoneID", buildJsonObject { put("zoneName", "Notes") })
-            put("resultsLimit", limit)
-            put("query", buildJsonObject {
-                put("recordType", "SearchIndexes")
-                putJsonArray("filterBy") {
-                    add(buildJsonObject {
-                        put("comparator", "EQUALS")
-                        put("fieldName", "indexName")
-                        put("fieldValue", buildJsonObject {
-                            put("type", "STRING")
-                            put("value", "recents")
+        // CloudKit's "recents" SearchIndex paginates aggressively (returns ~13
+        // records per page even when we ask for more). It hands back a
+        // `continuationMarker` whenever there's another page. We loop until
+        // we've collected `limit` notes or run out of continuation markers.
+        val all = mutableListOf<NoteSummary>()
+        var continuation: String? = null
+        var page = 0
+        val tStart = System.currentTimeMillis()
+        while (all.size < limit) {
+            val remaining = limit - all.size
+            val payload: JsonObject = buildJsonObject {
+                put("zoneID", buildJsonObject { put("zoneName", "Notes") })
+                put("resultsLimit", remaining)
+                if (continuation != null) put("continuationMarker", continuation!!)
+                put("query", buildJsonObject {
+                    put("recordType", "SearchIndexes")
+                    putJsonArray("filterBy") {
+                        add(buildJsonObject {
+                            put("comparator", "EQUALS")
+                            put("fieldName", "indexName")
+                            put("fieldValue", buildJsonObject {
+                                put("type", "STRING")
+                                put("value", "recents")
+                            })
                         })
-                    })
+                    }
+                    putJsonArray("sortBy") {
+                        add(buildJsonObject {
+                            put("fieldName", "modTime")
+                            put("ascending", false)
+                        })
+                    }
+                })
+                putJsonArray("desiredKeys") {
+                    listOf("TitleEncrypted", "SnippetEncrypted", "ModificationDate", "Deleted", "Folder")
+                        .forEach { add(JsonPrimitive(it)) }
                 }
-                putJsonArray("sortBy") {
-                    add(buildJsonObject {
-                        put("fieldName", "modTime")
-                        put("ascending", false)
-                    })
-                }
-            })
-            putJsonArray("desiredKeys") {
-                listOf("TitleEncrypted", "SnippetEncrypted", "ModificationDate", "Deleted", "Folder")
-                    .forEach { add(JsonPrimitive(it)) }
             }
+            Log.i(TAG, "fetchRecents page=$page: requesting up to $remaining (have ${all.size}/$limit)")
+            val t0 = System.currentTimeMillis()
+            val (status, raw) = postJson("/records/query", payload)
+            val elapsed = System.currentTimeMillis() - t0
+            Log.i(TAG, "fetchRecents page=$page response: HTTP $status, ${raw.length}B in ${elapsed}ms")
+            if (status !in 200..299) {
+                Log.e(TAG, "fetchRecents page=$page FAILED body=${raw.take(800)}")
+                error("CloudKit records/query HTTP $status: ${raw.take(800)}")
+            }
+            val parsed = LENIENT_JSON.decodeFromString(QueryResponse.serializer(), raw)
+            val pageResults = (parsed.records ?: emptyList()).map { rec ->
+                NoteSummary(
+                    recordName = rec.recordName ?: "",
+                    title = rec.fields?.get("TitleEncrypted")?.let(::decodeEncryptedString),
+                    snippet = rec.fields?.get("SnippetEncrypted")?.let(::decodeEncryptedString),
+                    modificationTimestampMs = rec.fields?.get("ModificationDate")
+                        ?.let(::extractStringValue)?.toLongOrNull(),
+                    deleted = rec.fields?.get("Deleted")?.let(::extractStringValue) == "1",
+                )
+            }
+            all.addAll(pageResults)
+            continuation = parsed.continuationMarker
+            page++
+            // Stop if the server signalled "no more pages" or returned an empty
+            // page (defensive — should not happen if continuationMarker says
+            // there is more).
+            if (continuation == null || pageResults.isEmpty()) break
         }
-        Log.i(TAG, "fetchRecents: requesting up to $limit notes")
-        val t0 = System.currentTimeMillis()
-        val (status, raw) = postJson("/records/query", payload)
-        val elapsed = System.currentTimeMillis() - t0
-        Log.i(TAG, "fetchRecents response: HTTP $status, ${raw.length}B in ${elapsed}ms")
-        if (status !in 200..299) {
-            Log.e(TAG, "fetchRecents FAILED body=${raw.take(800)}")
-            error("CloudKit records/query HTTP $status: ${raw.take(800)}")
-        }
-        val parsed = LENIENT_JSON.decodeFromString(QueryResponse.serializer(), raw)
-        val results = (parsed.records ?: emptyList()).map { rec ->
-            NoteSummary(
-                recordName = rec.recordName ?: "",
-                title = rec.fields?.get("TitleEncrypted")?.let(::decodeEncryptedString),
-                snippet = rec.fields?.get("SnippetEncrypted")?.let(::decodeEncryptedString),
-                modificationTimestampMs = rec.fields?.get("ModificationDate")
-                    ?.let(::extractStringValue)?.toLongOrNull(),
-                deleted = rec.fields?.get("Deleted")?.let(::extractStringValue) == "1",
-            )
-        }
-        Log.i(TAG, "fetchRecents: returning ${results.size} records (continuationMarker=${parsed.continuationMarker != null})")
-        for ((i, n) in results.withIndex()) {
+        val totalElapsed = System.currentTimeMillis() - tStart
+        Log.i(TAG, "fetchRecents: returning ${all.size} records across $page pages in ${totalElapsed}ms")
+        for ((i, n) in all.withIndex()) {
             Log.i(
                 TAG,
                 "  [$i] ${n.recordName} title='${n.title?.take(40)}' " +
@@ -116,7 +136,7 @@ class AppleNotesClient(
                     "mod=${n.modificationTimestampMs} deleted=${n.deleted}",
             )
         }
-        return results
+        return all
     }
 
     @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
