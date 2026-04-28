@@ -353,6 +353,7 @@ class AppleNotesClient(
         val textDataB64 = com.example.applenotes.proto.NoteCreator.buildEmptyNoteB64(
             ourReplicaUuid, noteText,
         )
+        val nowMs = System.currentTimeMillis()
         val payload: JsonObject = buildJsonObject {
             put("zoneID", buildJsonObject { put("zoneName", "Notes") })
             putJsonArray("operations") {
@@ -376,6 +377,37 @@ class AppleNotesClient(
                             })
                             // Reuse Folder reference structure verbatim from the sample note.
                             put("Folder", folderRef)
+                            // CRITICAL: without ModificationDate + CreationDate
+                            // CloudKit defaults them to .NET DateTime.MinValue
+                            // (year 1, encoded as -62135769600000 ms). Mac's
+                            // notesync sees that sentinel and skips syncing
+                            // the record to local — the user creates a note
+                            // from Android, iCloud has it, Mac never shows it.
+                            put("ModificationDate", buildJsonObject {
+                                put("type", "TIMESTAMP")
+                                put("value", nowMs)
+                            })
+                            put("CreationDate", buildJsonObject {
+                                put("type", "TIMESTAMP")
+                                put("value", nowMs)
+                            })
+                            // The remaining fields a Mac-created note has —
+                            // mirror them so the new record looks identical
+                            // to what Mac would produce. INT64=0 means "use
+                            // the default": no special paper, default
+                            // attachment view, not deleted.
+                            put("PaperStyleType", buildJsonObject {
+                                put("type", "INT64")
+                                put("value", 0)
+                            })
+                            put("AttachmentViewType", buildJsonObject {
+                                put("type", "INT64")
+                                put("value", 0)
+                            })
+                            put("Deleted", buildJsonObject {
+                                put("type", "INT64")
+                                put("value", 0)
+                            })
                         })
                     })
                 })
