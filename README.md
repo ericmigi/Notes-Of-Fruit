@@ -21,9 +21,12 @@ report for the next person (or agent) who picks it up.
 | Auto-save on lifecycle pause | Works (lifecycle `ON_PAUSE` only — see [AppleNotesApp.kt:1052](app/src/main/java/com/example/applenotes/ui/AppleNotesApp.kt)) |
 | Share OUT (Android intent chooser) | Works (plaintext only) |
 | Delete | Uses CloudKit `forceDelete`; Mac surfaces as "Recently Deleted" (server-managed, not a hard wipe) |
-| Format display (headings, lists, checkboxes) | Decoded but not rendered yet (Phase D1 done; D2 pending) |
-| Format input toolbar | Not built |
-| Image attachments | Renders `￼` stub; no image display |
+| Format display (paragraph styles + inline) | Works — Title / Heading / Subheading / Body / Monospaced; Bulleted / Dashed / Numbered / Checkbox; bold / italic / underline / strikethrough; clickable links |
+| Table attachments | Decoded from `MergeableDataEncrypted` (CRDT graph), rendered as a real grid |
+| Image attachments | Fetched as CKAsset bytes from the Media reference, rendered inline |
+| Other attachments (sketches, maps, etc.) | Rendered as a labeled placeholder card |
+| Format input toolbar | Works — paragraph style picker, list toggles (bullet/dash/numbered/checkbox), inline B/I/U/S, link |
+| Tap-to-toggle checkbox | Works in formatted view (auto-saves) |
 | Conflict UX | Auto-retry on CONFLICT/oplock; no concurrent-edit merge yet |
 
 ## The most important thing we think we learned (not yet end-to-end confirmed)
@@ -163,22 +166,73 @@ of Mac trashing — we ruled this out by sampling.
 - `￼` (U+FFFC OBJECT REPLACEMENT) is Apple's placeholder for inline attachments.
   We pass through but don't render the attachment.
 
-### Paragraph styles (in `AttributeRun.f2.f3`)
+### Paragraph styles (`AttributeRun.f2.f1`)
 
 | Code | Style |
 |---|---|
-| 0 | Body |
-| 1 | Title |
-| 2 | Heading |
-| 3 | Subheading |
+| 0 | Title (also: implicit for the first line) |
+| 1 | Heading |
+| 2 | Subheading |
+| 3 | Body (also: f1 absent → Body) |
 | 4 | Monospaced |
 | 100 | Bulleted list |
-| 101 | Checkbox (with `f4=1` if checked) |
+| 101 | Dashed list |
 | 102 | Numbered list |
+| 103 | Checkbox list |
 
-`f9` inside `f2` is a 16-byte paragraph UUID (Mac uses these; iCloud.com doesn't,
-yet both round-trip). Decode via
-[`NoteBodyEditor.parseAttributeRuns`](app/src/main/java/com/example/applenotes/proto/NoteBodyEditor.kt).
+(The earlier draft of this README listed 0=Body / 1=Title / 101=Checkbox. Wrong:
+verified by sampling a baseline note that contained one of every style.)
+
+Checkbox checked-state lives at `AttributeRun.f2.f5` — a 20-byte sub-message
+containing `{f1: 16-byte UUID, f2: 0|1 (done flag)}`, NOT in `AttributeRun.f2.f4`.
+
+### Inline formatting (siblings of `AttributeRun.f2`)
+
+| Field | Meaning |
+|---|---|
+| `f5` (varint) | font weight enum: 1=Bold, 2=Italic, 3=BoldItalic |
+| `f6` (varint) | underlined (bool) |
+| `f7` (varint) | strikethrough (bool) |
+| `f9` (bytes) | link URL (UTF-8 string) |
+| `f12` (msg) | attachment_info `{f1: UUID-string, f2: UTI-string}` (table/image/etc.) |
+
+Decode via [`NoteBodyEditor.parseAttributeRuns`](app/src/main/java/com/example/applenotes/proto/NoteBodyEditor.kt).
+Re-encode via [`NoteBodyEditor.encodeAttributeRunField`](app/src/main/java/com/example/applenotes/proto/NoteBodyEditor.kt).
+
+### Table attachments
+
+Tables are stored as separate `Attachment` CKRecords (UTI
+`com.apple.notes.table`). Their content lives in `MergeableDataEncrypted` — a
+zlib-deflate'd protobuf encoding Apple's MergeableData CRDT graph. The graph
+nodes form a typed object soup:
+
+- **KeyItems** (field 4): string field names — `self`, `crRows`, `crColumns`,
+  `cellColumns`, `crTableColumnDirection`, `identity`, `UUIDIndex`.
+- **TypeItems** (field 5): string type names — `com.apple.CRDT.NSString`,
+  `com.apple.CRDT.NSUUID`, `com.apple.notes.ICTable`, etc. Indexed.
+- **UUIDItems** (field 6): 16-byte UUIDs. Indexed.
+- **GraphObjects** (field 3): repeated, indexed. Each is one of:
+  - `f1` List, `f6` Dictionary, `f10` String (with f2 = current text),
+    `f13` CustomMap (typed map, like ICTable), `f16` OrderedSet.
+
+The root ICTable's CustomMap has entries `crRows` (OrderedSet of row UUIDs),
+`crColumns` (OrderedSet of column UUIDs), and `cellColumns` (Dict of
+col_uuid → Dict of row_uuid → string_obj_id). Walk those to extract a 2D
+grid; resolve each string_obj_id to its NSString.currentText.
+
+See [`MergeableDataDecoder.kt`](app/src/main/java/com/example/applenotes/proto/MergeableDataDecoder.kt).
+The decoder uses cellColumns iteration order as the column order and
+first-appearance order across columns as the row order — crRows/crColumns
+OrderedSets carry the canonical visual order via a separate UUIDIndex layer
+that we don't fully reconstruct yet, but the iteration order matches the
+visual order for tables created left-to-right top-to-bottom.
+
+### Image attachments
+
+Image Attachment records carry a `Media` field that's a CKReference to a
+separate "Media" record. Look up the media record; its `Asset` (or
+`MediaEncrypted`) field is a CKAsset whose `value.downloadURL` is the binary's
+signed download URL. GET it with the session's cookies.
 
 ## What we tried that failed
 

@@ -882,24 +882,33 @@ object NoteBodyEditor {
     //     bytes paragraphUuid     = 9;  // 16-byte UUID identifying the paragraph
     //   }
     //
-    // styleType codes observed across the user's library:
-    //   0 (or absent) = BODY (default body text)
-    //   1             = TITLE (only seen at the start of "Terminology")
-    //   100           = BULLETED_LIST (•)
-    //   101           = CHECKBOX_LIST (☐ / ☑ via `checked`)
-    //   102           = NUMBERED_LIST (1.)
-    // (Headings 2/3 / monospaced 4 not observed in this library; tolerate them
-    // when found by treating styleType as ParagraphStyle directly.)
+    // ParagraphStyle.f1 (style_type) values, verified by sampling a baseline
+    // note that contains every style iCloud Notes' formatting toolbar can
+    // produce. The iCloud client omits f1 entirely for the default Body style;
+    // an absent field decodes as 0 (proto3 default), which we'd then have to
+    // disambiguate from explicit 0 (Title). We disambiguate via "field
+    // present?", not via the decoded value — see parseAttributeRuns below.
+    //
+    //   0   = TITLE         (first line / explicitly applied)
+    //   1   = HEADING
+    //   2   = SUBHEADING
+    //   3   = BODY          (also: f1 absent => Body)
+    //   4   = MONOSPACED
+    //   100 = BULLETED_LIST (•)
+    //   101 = DASHED_LIST   (–)
+    //   102 = NUMBERED_LIST (1.)
+    //   103 = CHECKBOX_LIST (☐/☑ — checked state in style.f5.f2)
 
     enum class ParagraphStyle(val code: Int) {
-        BODY(0),
-        TITLE(1),
-        HEADING(2),
-        SUBHEADING(3),
+        BODY(3),
+        TITLE(0),
+        HEADING(1),
+        SUBHEADING(2),
         MONOSPACED(4),
         BULLETED_LIST(100),
-        CHECKBOX_LIST(101),
-        NUMBERED_LIST(102);
+        DASHED_LIST(101),
+        NUMBERED_LIST(102),
+        CHECKBOX_LIST(103);
         companion object {
             fun fromCode(c: Int): ParagraphStyle = values().firstOrNull { it.code == c } ?: BODY
         }
@@ -910,11 +919,30 @@ object NoteBodyEditor {
      * chars this span covers (in tree-walk order, matching the visible text
      * returned by [readVisibleText]). The spans are returned in order; their
      * lengths sum to the visible text length (modulo Apple bugs).
+     *
+     * Inline fields below come from the AttributeRun message itself (siblings
+     * of `paragraph_style`), not from inside ParagraphStyle:
+     *  - bold/italic     => f5 (font_weight enum: 1=Bold, 2=Italic, 3=both)
+     *  - underline       => f6
+     *  - strikethrough   => f7
+     *  - linkUrl         => f9 (UTF-8 URL string)
+     *  - isAttachment    => f12 present (table, image, etc. — the visible
+     *                       char is U+FFFC; we don't decode the attachment yet)
      */
     data class AttrSpan(
         val length: Int,
         val style: ParagraphStyle,
-        val checked: Boolean,
+        val checked: Boolean = false,
+        val bold: Boolean = false,
+        val italic: Boolean = false,
+        val underline: Boolean = false,
+        val strikethrough: Boolean = false,
+        val linkUrl: String? = null,
+        val isAttachment: Boolean = false,
+        /** Attachment record UUID — null unless [isAttachment]. */
+        val attachmentRecordName: String? = null,
+        /** UTI string e.g. "com.apple.notes.table", "public.png". */
+        val attachmentType: String? = null,
     )
 
     fun parseAttributeRuns(noteStoreProtoBytes: ByteArray): List<AttrSpan> = runCatching {
@@ -930,8 +958,14 @@ object NoteBodyEditor {
         val FIELD_AR = 5
         val FIELD_AR_LENGTH = 1
         val FIELD_AR_STYLE = 2
+        val FIELD_AR_FONTWEIGHT = 5
+        val FIELD_AR_UNDERLINE = 6
+        val FIELD_AR_STRIKE = 7
+        val FIELD_AR_LINK = 9
+        val FIELD_AR_ATTACHMENT = 12
         val FIELD_PS_STYLETYPE = 1
-        val FIELD_PS_CHECKED = 4
+        val FIELD_PS_CHECKLIST = 5
+        val FIELD_CL_CHECKED = 2
         val out = ArrayList<AttrSpan>()
         for (f in noteFields) {
             if (f.fieldNumber != FIELD_AR || f.wireType != ProtobufWire.WIRE_LENGTH_DELIM) continue
@@ -942,18 +976,71 @@ object NoteBodyEditor {
             val styleField = arFields.firstOrNull {
                 it.fieldNumber == FIELD_AR_STYLE && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
             }
-            var styleCode = 0
+            var style: ParagraphStyle = ParagraphStyle.BODY
             var checked = false
             if (styleField != null) {
                 val ps = ProtobufWire.decode(styleField.payload)
-                styleCode = ps.firstOrNull {
+                val styleTypeField = ps.firstOrNull {
                     it.fieldNumber == FIELD_PS_STYLETYPE && it.wireType == ProtobufWire.WIRE_VARINT
-                }?.let { ProtobufWire.decodeVarint(it).toInt() } ?: 0
-                checked = (ps.firstOrNull {
-                    it.fieldNumber == FIELD_PS_CHECKED && it.wireType == ProtobufWire.WIRE_VARINT
-                }?.let { ProtobufWire.decodeVarint(it) } ?: 0L) != 0L
+                }
+                style = if (styleTypeField != null) {
+                    ParagraphStyle.fromCode(ProtobufWire.decodeVarint(styleTypeField).toInt())
+                } else {
+                    // f1 absent (iCloud's encoding for default Body).
+                    ParagraphStyle.BODY
+                }
+                val checklist = ps.firstOrNull {
+                    it.fieldNumber == FIELD_PS_CHECKLIST && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+                }
+                if (checklist != null) {
+                    val cl = ProtobufWire.decode(checklist.payload)
+                    checked = (cl.firstOrNull {
+                        it.fieldNumber == FIELD_CL_CHECKED && it.wireType == ProtobufWire.WIRE_VARINT
+                    }?.let { ProtobufWire.decodeVarint(it) } ?: 0L) != 0L
+                }
             }
-            out.add(AttrSpan(length, ParagraphStyle.fromCode(styleCode), checked))
+            val fontWeight = arFields.firstOrNull {
+                it.fieldNumber == FIELD_AR_FONTWEIGHT && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it).toInt() } ?: 0
+            val underline = (arFields.firstOrNull {
+                it.fieldNumber == FIELD_AR_UNDERLINE && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L) != 0L
+            val strike = (arFields.firstOrNull {
+                it.fieldNumber == FIELD_AR_STRIKE && it.wireType == ProtobufWire.WIRE_VARINT
+            }?.let { ProtobufWire.decodeVarint(it) } ?: 0L) != 0L
+            val linkUrl = arFields.firstOrNull {
+                it.fieldNumber == FIELD_AR_LINK && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }?.let { runCatching { it.payload.decodeToString() }.getOrNull() }
+            val attachmentField = arFields.firstOrNull {
+                it.fieldNumber == FIELD_AR_ATTACHMENT && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+            }
+            var attachmentRecord: String? = null
+            var attachmentType: String? = null
+            if (attachmentField != null) {
+                // f12 = AttachmentInfo { f1: UUID-string, f2: UTI-string }
+                val info = ProtobufWire.decode(attachmentField.payload)
+                attachmentRecord = info.firstOrNull {
+                    it.fieldNumber == 1 && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+                }?.let { runCatching { it.payload.decodeToString() }.getOrNull() }
+                attachmentType = info.firstOrNull {
+                    it.fieldNumber == 2 && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+                }?.let { runCatching { it.payload.decodeToString() }.getOrNull() }
+            }
+            out.add(
+                AttrSpan(
+                    length = length,
+                    style = style,
+                    checked = checked,
+                    bold = (fontWeight and 1) != 0,
+                    italic = (fontWeight and 2) != 0,
+                    underline = underline,
+                    strikethrough = strike,
+                    linkUrl = linkUrl,
+                    isAttachment = attachmentField != null,
+                    attachmentRecordName = attachmentRecord,
+                    attachmentType = attachmentType,
+                ),
+            )
         }
         out
     }.getOrElse { emptyList() }
@@ -961,5 +1048,286 @@ object NoteBodyEditor {
     fun parseAttributeRunsFromBase64(textDataEncryptedB64: String): List<AttrSpan> {
         val compressed = Base64.decode(textDataEncryptedB64)
         return parseAttributeRuns(Gzip.decompress(compressed))
+    }
+
+    // ----- Encoding AttrSpan back into proto attribute_run fields -----
+
+    private const val FIELD_AR_LENGTH = 1
+    private const val FIELD_AR_STYLE = 2
+    private const val FIELD_AR_FONTWEIGHT = 5
+    private const val FIELD_AR_UNDERLINE = 6
+    private const val FIELD_AR_STRIKE = 7
+    private const val FIELD_AR_LINK = 9
+    private const val FIELD_AR_ATTACHMENT = 12
+    private const val FIELD_PS_STYLETYPE = 1
+    private const val FIELD_PS_FONTVARIANT = 2  // Apple emits 4 in observed notes
+    private const val FIELD_PS_CHECKLIST = 5
+
+    /**
+     * Re-encode an AttrSpan back into a proto AttributeRun message.
+     *
+     * @param paragraphUuid 16-byte UUID for checkbox style (uniquely identifies
+     *  the checkbox row across replicas). Caller is responsible for
+     *  consistency: the same paragraph should keep its UUID across edits;
+     *  generating a fresh one on every keystroke would explode Apple's
+     *  per-note replica cap.
+     */
+    internal fun encodeAttributeRunField(
+        span: AttrSpan,
+        checkboxUuid: ByteArray? = null,
+    ): ProtobufWire.Field {
+        val arFields = mutableListOf<ProtobufWire.Field>()
+        arFields.add(ProtobufWire.encodeVarintField(FIELD_AR_LENGTH, span.length.toLong()))
+
+        // Build paragraph_style sub-message. Apple omits f1 for default Body
+        // (style.code == 3) — match that to keep diffs minimal.
+        val needsStyleField = span.style != ParagraphStyle.BODY ||
+            span.style == ParagraphStyle.CHECKBOX_LIST
+        if (needsStyleField || span.linkUrl != null || span.bold || span.italic ||
+            span.underline || span.strikethrough || span.isAttachment) {
+            val psFields = mutableListOf<ProtobufWire.Field>()
+            if (span.style != ParagraphStyle.BODY) {
+                psFields.add(ProtobufWire.encodeVarintField(FIELD_PS_STYLETYPE, span.style.code.toLong()))
+            }
+            psFields.add(ProtobufWire.encodeVarintField(FIELD_PS_FONTVARIANT, 4L))
+            if (span.style == ParagraphStyle.CHECKBOX_LIST) {
+                val uuid = checkboxUuid ?: ByteArray(16).also { java.util.UUID.randomUUID().let { u ->
+                    val msb = u.mostSignificantBits
+                    val lsb = u.leastSignificantBits
+                    for (i in 0 until 8) it[i] = ((msb shr (56 - i * 8)) and 0xFF).toByte()
+                    for (i in 0 until 8) it[8 + i] = ((lsb shr (56 - i * 8)) and 0xFF).toByte()
+                }}
+                val checklistFields = listOf(
+                    ProtobufWire.Field(1, ProtobufWire.WIRE_LENGTH_DELIM, uuid),
+                    ProtobufWire.encodeVarintField(2, if (span.checked) 1L else 0L),
+                )
+                psFields.add(ProtobufWire.Field(
+                    FIELD_PS_CHECKLIST, ProtobufWire.WIRE_LENGTH_DELIM,
+                    ProtobufWire.encode(checklistFields),
+                ))
+            }
+            arFields.add(ProtobufWire.Field(
+                FIELD_AR_STYLE, ProtobufWire.WIRE_LENGTH_DELIM,
+                ProtobufWire.encode(psFields),
+            ))
+        }
+
+        // Inline formatting siblings of paragraph_style.
+        val fontWeight = (if (span.bold) 1 else 0) or (if (span.italic) 2 else 0)
+        if (fontWeight != 0) {
+            arFields.add(ProtobufWire.encodeVarintField(FIELD_AR_FONTWEIGHT, fontWeight.toLong()))
+        }
+        if (span.underline) arFields.add(ProtobufWire.encodeVarintField(FIELD_AR_UNDERLINE, 1L))
+        if (span.strikethrough) arFields.add(ProtobufWire.encodeVarintField(FIELD_AR_STRIKE, 1L))
+        if (span.linkUrl != null) {
+            arFields.add(ProtobufWire.encodeString(FIELD_AR_LINK, span.linkUrl))
+        }
+        if (span.isAttachment && span.attachmentRecordName != null) {
+            val info = mutableListOf<ProtobufWire.Field>()
+            info.add(ProtobufWire.encodeString(1, span.attachmentRecordName))
+            if (span.attachmentType != null) info.add(ProtobufWire.encodeString(2, span.attachmentType))
+            arFields.add(ProtobufWire.Field(
+                FIELD_AR_ATTACHMENT, ProtobufWire.WIRE_LENGTH_DELIM,
+                ProtobufWire.encode(info),
+            ))
+        }
+
+        return ProtobufWire.Field(
+            FIELD_NOTE_ATTRIBUTE_RUN, ProtobufWire.WIRE_LENGTH_DELIM,
+            ProtobufWire.encode(arFields),
+        )
+    }
+
+    /**
+     * Coalesce identical-formatting consecutive [AttrSpan]s into single runs.
+     * Apple iCloud always emits the most compact form, so a series of bold
+     * chars becomes one run. Equality compares everything except length.
+     */
+    fun coalesceSpans(spans: List<AttrSpan>): List<AttrSpan> {
+        if (spans.size <= 1) return spans
+        val out = ArrayList<AttrSpan>()
+        for (s in spans) {
+            val prev = out.lastOrNull()
+            if (prev != null && spansShareFormat(prev, s)) {
+                out[out.size - 1] = prev.copy(length = prev.length + s.length)
+            } else out.add(s)
+        }
+        return out
+    }
+
+    private fun spansShareFormat(a: AttrSpan, b: AttrSpan): Boolean {
+        // Two attachments must never coalesce — each owns its own f12.
+        if (a.isAttachment || b.isAttachment) return false
+        return a.style == b.style && a.checked == b.checked && a.bold == b.bold &&
+            a.italic == b.italic && a.underline == b.underline &&
+            a.strikethrough == b.strikethrough && a.linkUrl == b.linkUrl
+    }
+
+    // ----- High-level paragraph-aware mutations the toolbar invokes. -----
+    //
+    // The editor tracks a flat List<AttrSpan> aligned with the visible text.
+    // Each helper returns a new list with the requested change applied. Lengths
+    // remain in sync with the underlying text — these never insert/remove
+    // characters; they only retag existing ones.
+    //
+    // Paragraph-style helpers operate on whole paragraphs (split by '\n'); the
+    // selection's range is mapped to the set of paragraphs it touches.
+    // Inline-style helpers operate on the exact char range of the selection,
+    // splitting spans at the boundaries.
+
+    /** Per-character expansion — convenient for range-based mutations. */
+    fun expandSpansToChars(text: String, spans: List<AttrSpan>): Array<AttrSpan> {
+        val out = arrayOfNulls<AttrSpan>(text.length)
+        var p = 0
+        for (s in spans) {
+            val end = (p + s.length).coerceAtMost(text.length)
+            for (i in p until end) out[i] = s.copy(length = 1)
+            p = end
+            if (p >= text.length) break
+        }
+        // Pad with default body for any tail not covered.
+        for (i in 0 until text.length) {
+            if (out[i] == null) out[i] = AttrSpan(length = 1, style = ParagraphStyle.BODY)
+        }
+        @Suppress("UNCHECKED_CAST")
+        return out as Array<AttrSpan>
+    }
+
+    /** Run-length encode a per-char span array back into coalesced spans. */
+    fun compactCharsToSpans(perChar: Array<AttrSpan>): List<AttrSpan> {
+        if (perChar.isEmpty()) return emptyList()
+        val out = ArrayList<AttrSpan>()
+        var i = 0
+        while (i < perChar.size) {
+            val cur = perChar[i]
+            var j = i + 1
+            while (j < perChar.size && spansShareFormat(perChar[j], cur)) j++
+            out.add(cur.copy(length = j - i))
+            i = j
+        }
+        return out
+    }
+
+    /** Compute paragraph ranges (char index → IntRange) for a full body. */
+    fun paragraphRanges(text: String): List<IntRange> {
+        if (text.isEmpty()) return listOf(0..-1)
+        val out = ArrayList<IntRange>()
+        var start = 0
+        for ((i, c) in text.withIndex()) {
+            if (c == '\n') {
+                out.add(start..i)
+                start = i + 1
+            }
+        }
+        if (start <= text.length - 1) out.add(start..(text.length - 1))
+        else if (text.endsWith('\n')) out.add(text.length until text.length)
+        return out
+    }
+
+    /** Paragraph index containing a given char position (or the final paragraph). */
+    fun paragraphIndexAt(text: String, charPos: Int): Int {
+        val ranges = paragraphRanges(text)
+        for ((i, r) in ranges.withIndex()) {
+            if (charPos in r) return i
+        }
+        return (ranges.size - 1).coerceAtLeast(0)
+    }
+
+    /**
+     * Set every char in selection [range] (paragraph-aligned) to [newStyle].
+     * If the selection spans multiple paragraphs, every paragraph in the range
+     * gets the new style. range.first/last are CHAR indices into [text].
+     */
+    fun setParagraphStyle(
+        text: String,
+        spans: List<AttrSpan>,
+        rangeStart: Int,
+        rangeEnd: Int,
+        newStyle: ParagraphStyle,
+    ): List<AttrSpan> {
+        if (text.isEmpty()) return spans
+        val perChar = expandSpansToChars(text, spans)
+        val ranges = paragraphRanges(text)
+        for (r in ranges) {
+            // Touch this paragraph if it overlaps the selection.
+            val overlaps = !(rangeEnd <= r.first || rangeStart > r.last)
+            if (!overlaps) continue
+            for (i in r) {
+                if (i in perChar.indices) perChar[i] = perChar[i].copy(
+                    style = newStyle,
+                    // Toggle off any list-specific state when leaving a list style.
+                    checked = if (newStyle == ParagraphStyle.CHECKBOX_LIST) perChar[i].checked else false,
+                )
+            }
+        }
+        return compactCharsToSpans(perChar)
+    }
+
+    enum class InlineKind { BOLD, ITALIC, UNDERLINE, STRIKETHROUGH }
+
+    /** Toggle an inline style across [rangeStart, rangeEnd). */
+    fun toggleInline(
+        text: String,
+        spans: List<AttrSpan>,
+        rangeStart: Int,
+        rangeEnd: Int,
+        kind: InlineKind,
+    ): List<AttrSpan> {
+        if (text.isEmpty() || rangeEnd <= rangeStart) return spans
+        val perChar = expandSpansToChars(text, spans)
+        // If every char in the range already has the style on, toggle it off;
+        // otherwise turn it on for the whole range.
+        val allOn = (rangeStart until rangeEnd).all { i ->
+            val s = perChar.getOrNull(i) ?: return@all true
+            when (kind) {
+                InlineKind.BOLD -> s.bold
+                InlineKind.ITALIC -> s.italic
+                InlineKind.UNDERLINE -> s.underline
+                InlineKind.STRIKETHROUGH -> s.strikethrough
+            }
+        }
+        val newValue = !allOn
+        for (i in rangeStart until rangeEnd.coerceAtMost(perChar.size)) {
+            perChar[i] = when (kind) {
+                InlineKind.BOLD -> perChar[i].copy(bold = newValue)
+                InlineKind.ITALIC -> perChar[i].copy(italic = newValue)
+                InlineKind.UNDERLINE -> perChar[i].copy(underline = newValue)
+                InlineKind.STRIKETHROUGH -> perChar[i].copy(strikethrough = newValue)
+            }
+        }
+        return compactCharsToSpans(perChar)
+    }
+
+    /** Toggle the checked state of the checkbox paragraph at [charPos]. */
+    fun toggleCheckbox(
+        text: String,
+        spans: List<AttrSpan>,
+        charPos: Int,
+    ): List<AttrSpan> {
+        val perChar = expandSpansToChars(text, spans)
+        val ranges = paragraphRanges(text)
+        val pIdx = paragraphIndexAt(text, charPos)
+        val r = ranges.getOrNull(pIdx) ?: return spans
+        val first = r.first.coerceIn(0, perChar.size - 1)
+        if (perChar[first].style != ParagraphStyle.CHECKBOX_LIST) return spans
+        val newChecked = !perChar[first].checked
+        for (i in r) if (i in perChar.indices) perChar[i] = perChar[i].copy(checked = newChecked)
+        return compactCharsToSpans(perChar)
+    }
+
+    /** Apply a hyperlink URL to [rangeStart, rangeEnd). null clears any link. */
+    fun setLink(
+        text: String,
+        spans: List<AttrSpan>,
+        rangeStart: Int,
+        rangeEnd: Int,
+        url: String?,
+    ): List<AttrSpan> {
+        if (text.isEmpty() || rangeEnd <= rangeStart) return spans
+        val perChar = expandSpansToChars(text, spans)
+        for (i in rangeStart until rangeEnd.coerceAtMost(perChar.size)) {
+            perChar[i] = perChar[i].copy(linkUrl = url)
+        }
+        return compactCharsToSpans(perChar)
     }
 }

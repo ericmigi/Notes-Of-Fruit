@@ -7,9 +7,11 @@ import com.example.applenotes.auth.USER_AGENT
 import com.example.applenotes.proto.NoteBodyEditor
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
+import io.ktor.client.request.get
 import io.ktor.client.request.headers
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.HttpResponse
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.contentType
@@ -310,6 +312,24 @@ class AppleNotesClient(
      * Delete a note via a hard CloudKit delete operation. Mac/iOS Notes
      * surface this as moving the note to "Recently Deleted" (server-managed).
      */
+    /**
+     * Download a CKAsset's binary body via its `downloadURL`. iCloud signs the
+     * URL with the session's auth so we just GET it with our cookie jar.
+     */
+    suspend fun fetchAssetBytes(downloadUrl: String): ByteArray? = runCatching {
+        val response: HttpResponse = httpClient.get(downloadUrl) {
+            headers {
+                append(HttpHeaders.UserAgent, USER_AGENT)
+                append(HttpHeaders.Cookie, session.cookieHeader)
+            }
+        }
+        if (response.status.value !in 200..299) {
+            Log.w(TAG, "fetchAssetBytes HTTP ${response.status.value} for $downloadUrl")
+            return@runCatching null
+        }
+        response.body<ByteArray>()
+    }.getOrNull()
+
     suspend fun deleteNote(recordName: String, recordChangeTag: String): String {
         val payload: JsonObject = buildJsonObject {
             put("zoneID", buildJsonObject { put("zoneName", "Notes") })
@@ -655,6 +675,18 @@ internal fun extractStringValue(field: JsonElement): String? {
     val obj = field as? JsonObject ?: return null
     val value = obj["value"] ?: return null
     return runCatching { value.jsonPrimitive.content }.getOrNull()
+}
+
+/**
+ * CKAsset fields look like
+ *   { "type": "ASSETID", "value": { "downloadURL": "...", "size": N, "fileChecksum": "..." } }
+ * Pull `value.downloadURL`. Some download URLs come back with `${f}` placeholders
+ * that need substitution; we surface the raw URL and let the caller request it.
+ */
+internal fun extractAssetDownloadUrl(field: JsonElement): String? {
+    val obj = field as? JsonObject ?: return null
+    val value = obj["value"] as? JsonObject ?: return null
+    return runCatching { value["downloadURL"]?.jsonPrimitive?.content }.getOrNull()
 }
 
 /**

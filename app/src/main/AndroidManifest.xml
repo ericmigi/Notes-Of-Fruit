@@ -35,6 +35,8 @@
                 <action android:name="com.example.applenotes.APPEND_BY_TITLE" />
                 <action android:name="com.example.applenotes.SET_BODY_BY_TITLE" />
                 <action android:name="com.example.applenotes.DELETE_BY_TITLE" />
+                <action android:name="com.example.applenotes.DUMP_BY_TITLE" />
+                <action android:name="com.example.applenotes.DUMP_RECORD" />
                 <action android:name="com.example.applenotes.CREATE" />
             </intent-filter>
         </receiver>

@@ -6,7 +6,11 @@ import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -43,6 +47,17 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.CheckBox
 import androidx.compose.material.icons.filled.CheckBoxOutlineBlank
+import androidx.compose.material.icons.filled.FormatBold
+import androidx.compose.material.icons.filled.FormatItalic
+import androidx.compose.material.icons.filled.FormatStrikethrough
+import androidx.compose.material.icons.filled.FormatUnderlined
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.HorizontalRule
+import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.automirrored.filled.FormatListBulleted
+import androidx.compose.material.icons.filled.FormatListNumbered
+import androidx.compose.material3.Surface
+import androidx.compose.ui.draw.clip
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -82,6 +97,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -93,10 +109,16 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import android.content.Intent
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
@@ -359,13 +381,21 @@ fun AppleNotesApp() {
             savedHint = lastSavedHint,
             lastSavedAtMs = lastSavedAtMs,
             onHintShown = { lastSavedHint = null },
+            onFetchAttachment = { rn ->
+                runCatching {
+                    AppleNotesClient(httpClient, s.session).lookupNote(rn)
+                }.getOrNull()
+            },
+            onFetchAsset = { url ->
+                AppleNotesClient(httpClient, s.session).fetchAssetBytes(url)
+            },
             onBack = {
                 // Restore the cached list instantly. No network round trip —
                 // `notesCache` was patched in place when we saved, so the snippet
                 // for the just-edited note already reflects our changes.
                 state = ScreenState.NotesList(s.session, s.notesCache, s.folders, s.selectedFolder)
             },
-            onSave = { newBody, isPureAppend, alsoExit ->
+            onSave = { newBody, isPureAppend, alsoExit, newSpans ->
                 scope.launch {
                     saving = true
                     try {
@@ -435,12 +465,12 @@ fun AppleNotesApp() {
                             // through the splice path which mirrors iCloud.com's
                             // pattern: slot promotion + split-and-tombstone +
                             // fresh ts on tombstones + new chunks for inserts.
-                            val newB64 = if (isPureAppend) {
+                            val newB64 = if (isPureAppend && newSpans == null) {
                                 val appended = newBody.removePrefix(originalBody)
                                 require(appended.isNotEmpty()) { "Pure-append marked but no new chars" }
                                 NoteAppender.appendBase64(textB64, uuid, appended, now)
                             } else {
-                                NoteAppender.setBodyBase64(textB64, uuid, newBody, now)
+                                NoteAppender.setBodyBase64(textB64, uuid, newBody, now, newSpans)
                             }
                             val (oldTitle, oldSnippet) = computeTitleAndSnippet(originalBody)
                             Log.i(
@@ -982,12 +1012,14 @@ internal fun computeTitleAndSnippet(body: String): Pair<String, String> {
 private fun NoteDetailScreen(
     record: NoteRecord,
     onBack: () -> Unit,
-    onSave: (newBody: String, isPureAppend: Boolean, alsoExit: Boolean) -> Unit,
+    onSave: (newBody: String, isPureAppend: Boolean, alsoExit: Boolean, newSpans: List<NoteBodyEditor.AttrSpan>?) -> Unit,
     onDelete: () -> Unit,
     saving: Boolean,
     savedHint: String? = null,
     lastSavedAtMs: Long? = null,
     onHintShown: () -> Unit = {},
+    onFetchAttachment: (suspend (String) -> NoteRecord?)? = null,
+    onFetchAsset: (suspend (String) -> ByteArray?)? = null,
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
     val shareContext = LocalContext.current
@@ -1023,18 +1055,19 @@ private fun NoteDetailScreen(
         mutableStateOf(initialTitle)
     }
     var bodyDraft by remember(record.recordName, record.recordChangeTag) {
-        mutableStateOf(initialBody)
+        mutableStateOf(androidx.compose.ui.text.input.TextFieldValue(initialBody))
     }
     val fullBodyForSave = when {
-        titleDraft.isEmpty() && bodyDraft.isEmpty() -> ""
-        titleDraft.isEmpty() -> bodyDraft
-        bodyDraft.isEmpty() -> titleDraft
-        else -> "$titleDraft\n$bodyDraft"
+        titleDraft.isEmpty() && bodyDraft.text.isEmpty() -> ""
+        titleDraft.isEmpty() -> bodyDraft.text
+        bodyDraft.text.isEmpty() -> titleDraft
+        else -> "$titleDraft\n${bodyDraft.text}"
     }
-    val isModified = fullBodyForSave != originalBody
+    // isModified is computed after spansDraft is declared below — see further down.
     val isPureAppend = remember(fullBodyForSave, originalBody) {
         fullBodyForSave.startsWith(originalBody) && fullBodyForSave.length > originalBody.length
     }
+    var isModified = fullBodyForSave != originalBody
 
     // Parse the note's attribute_runs once per record load — kept around so
     // the splice path in NoteAppender can preserve paragraph styles through
@@ -1044,6 +1077,77 @@ private fun NoteDetailScreen(
         record.stringField("TextDataEncrypted")?.let { b64 ->
             runCatching { NoteBodyEditor.parseAttributeRunsFromBase64(b64) }.getOrNull()
         }.orEmpty()
+    }
+    // attrSpans cover the FULL visible text including the title line (which
+    // we render separately in the app bar). Trim the title's worth of spans
+    // off the front so styleAt indexes align with `initialBody`. Computed
+    // from spansDraft so toolbar/tap mutations are reflected live.
+    // (spansDraft is declared below; we wrap in remember after that.)
+    // Default to the formatted view when the note has any non-body paragraph
+    // style (heading, bullets, checkboxes, etc.). Plain notes go straight to
+    // the editor — no extra tap needed. Tapping the formatted view drops
+    // into the editor; we don't auto-toggle back, to avoid losing edits.
+    val bodyAttrSpansInit = remember(originalBody, attrSpans) {
+        val skip = if (originalBody.contains('\n')) initialTitle.length + 1
+                   else initialTitle.length
+        attrSpansAfter(attrSpans, skip)
+    }
+    val hasRichFormatting = remember(bodyAttrSpansInit) {
+        bodyAttrSpansInit.any {
+            it.style != NoteBodyEditor.ParagraphStyle.BODY &&
+                it.style != NoteBodyEditor.ParagraphStyle.TITLE
+        }
+    }
+    var viewMode by remember(record.recordName, record.recordChangeTag) {
+        mutableStateOf(hasRichFormatting && initialBody.isNotEmpty())
+    }
+
+    // Mutable AttrSpan list driving the editor's formatting state. Covers the
+    // FULL visible body (title + "\n" + body) — same coordinate space as the
+    // proto. Toolbar mutations operate on body-relative ranges and we add the
+    // title prefix length when applying.
+    var spansDraft by remember(record.recordName, record.recordChangeTag) {
+        mutableStateOf(attrSpans)
+    }
+    // Track the previous full-body text so we can keep [spansDraft] in sync
+    // with character insertions/deletions.
+    var prevFullBody by remember(record.recordName, record.recordChangeTag) {
+        mutableStateOf(originalBody)
+    }
+    LaunchedEffect(fullBodyForSave) {
+        if (fullBodyForSave == prevFullBody) return@LaunchedEffect
+        spansDraft = syncSpansToText(prevFullBody, spansDraft, fullBodyForSave)
+        prevFullBody = fullBodyForSave
+    }
+    // Format-only changes need to mark the note as modified so save fires.
+    if (spansDraft != attrSpans) isModified = true
+
+    // Live body-only spans for formatted view (mirrors any draft mutation).
+    val bodyAttrSpans = remember(titleDraft, fullBodyForSave, spansDraft) {
+        val skip = if (fullBodyForSave.contains('\n')) titleDraft.length + 1
+                   else titleDraft.length
+        attrSpansAfter(spansDraft, skip)
+    }
+
+    // Resolve attachment cards. For each AttrSpan with isAttachment + recordName
+    // we kick off an async lookup, decode the result by attachment type
+    // ("com.apple.notes.table" → table grid; "public.png/jpeg/heic" → image
+    // bytes), and feed the cache into FormattedNoteBody.
+    val attachmentCache = remember(record.recordName, record.recordChangeTag) {
+        mutableStateOf<Map<String, AttachmentContent>>(emptyMap())
+    }
+    LaunchedEffect(record.recordName, record.recordChangeTag, onFetchAttachment) {
+        val fetcher = onFetchAttachment ?: return@LaunchedEffect
+        val assetFetcher = onFetchAsset ?: { _ -> null }
+        val recordNames = bodyAttrSpans.mapNotNull { it.attachmentRecordName }.toSet()
+        for (rn in recordNames) {
+            if (attachmentCache.value.containsKey(rn)) continue
+            val rec = runCatching { fetcher(rn) }.getOrNull() ?: continue
+            val content = decodeAttachment(rec, assetFetcher, fetcher)
+            if (content != null) {
+                attachmentCache.value = attachmentCache.value + (rn to content)
+            }
+        }
     }
 
     var showDeleteDialog by remember { mutableStateOf(false) }
@@ -1058,7 +1162,7 @@ private fun NoteDetailScreen(
     DisposableEffect(lifecycleOwner, isModified, fullBodyForSave, isPureAppend) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_PAUSE && isModified && !saving) {
-                onSave(fullBodyForSave, isPureAppend, false)
+                onSave(fullBodyForSave, isPureAppend, false, spansDraft)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -1087,7 +1191,7 @@ private fun NoteDetailScreen(
         if (isModified && !saving) {
             // Save and navigate atomically. Parent handles the navigation in
             // the save's success callback (sees alsoExit=true).
-            onSave(fullBodyForSave, isPureAppend, true)
+            onSave(fullBodyForSave, isPureAppend, true, spansDraft)
         } else {
             onBack()
         }
@@ -1151,7 +1255,7 @@ private fun NoteDetailScreen(
                         if (isModified) {
                             IconButton(
                                 enabled = !saving,
-                                onClick = { onSave(fullBodyForSave, isPureAppend, false) },
+                                onClick = { onSave(fullBodyForSave, isPureAppend, false, spansDraft) },
                             ) {
                                 Icon(Icons.Default.Check, contentDescription = "Save")
                             }
@@ -1196,34 +1300,69 @@ private fun NoteDetailScreen(
         Column(
             modifier = Modifier.fillMaxSize().padding(padding),
         ) {
-            // Single unified editor — no edit/view mode toggle. The user can
-            // read or write at any time; the body is always editable. Title
-            // lives in the app bar (editable there) so it's never duplicated
-            // here.
-            BasicTextField(
-                value = bodyDraft,
-                onValueChange = { bodyDraft = it },
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 16.dp),
-                textStyle = MaterialTheme.typography.bodyLarge.copy(
-                    color = MaterialTheme.colorScheme.onSurface,
-                ),
-                cursorBrush = androidx.compose.ui.graphics.SolidColor(MaterialTheme.colorScheme.primary),
-                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
-                decorationBox = { inner ->
-                    if (bodyDraft.isEmpty()) {
-                        Text(
-                            "Start typing…",
-                            style = MaterialTheme.typography.bodyLarge.copy(
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            ),
+            // Body display: formatted view by default for notes that carry
+            // paragraph styling (headings, lists, checkboxes), plain editor
+            // otherwise. Tapping the formatted view drops into the editor.
+            if (viewMode) {
+                FormattedNoteBody(
+                    fullBody = bodyDraft.text,
+                    titlePrefixLength = 0,
+                    attrSpans = bodyAttrSpans,
+                    attachmentContent = attachmentCache.value,
+                    onTap = { viewMode = false },
+                    onToggleCheckbox = { bodyParaStart ->
+                        val skip = if (fullBodyForSave.contains('\n')) titleDraft.length + 1
+                            else titleDraft.length
+                        val fullPos = bodyParaStart + skip
+                        spansDraft = NoteBodyEditor.toggleCheckbox(
+                            fullBodyForSave, spansDraft, fullPos,
                         )
-                    }
-                    inner()
-                },
-            )
+                        // Auto-save the toggle so check state persists.
+                        onSave(fullBodyForSave, false, false, spansDraft)
+                    },
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                )
+            } else {
+                BasicTextField(
+                    value = bodyDraft,
+                    onValueChange = { bodyDraft = it },
+                    visualTransformation = remember(bodyAttrSpans) {
+                        FormattingVisualTransformation(bodyAttrSpans)
+                    },
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp, vertical = 16.dp),
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(
+                        color = MaterialTheme.colorScheme.onSurface,
+                    ),
+                    cursorBrush = androidx.compose.ui.graphics.SolidColor(MaterialTheme.colorScheme.primary),
+                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                    decorationBox = { inner ->
+                        if (bodyDraft.text.isEmpty()) {
+                            Text(
+                                "Start typing…",
+                                style = MaterialTheme.typography.bodyLarge.copy(
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                ),
+                            )
+                        }
+                        inner()
+                    },
+                )
+                // Format toolbar — only shown while editing.
+                FormattingToolbar(
+                    titlePrefixLength = if (titleDraft.isEmpty()) 0 else titleDraft.length + 1,
+                    bodyValue = bodyDraft,
+                    fullBody = fullBodyForSave,
+                    spans = spansDraft,
+                    onSpansChange = { newSpans ->
+                        spansDraft = newSpans
+                    },
+                )
+            }
             // Footer: modification date + char count + chord guidance.
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             Row(
@@ -1240,7 +1379,7 @@ private fun NoteDetailScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
-                    text = "${bodyDraft.length} chars",
+                    text = "${bodyDraft.text.length} chars",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1274,12 +1413,88 @@ private fun NoteDetailScreen(
  *
  * Tap anywhere to switch the screen into the plain-text editor.
  */
+/** Holds decoded payload for an attachment record (table grid, image bytes, etc). */
+sealed class AttachmentContent {
+    data class Table(val grid: com.example.applenotes.proto.MergeableDataDecoder.TableGrid) : AttachmentContent()
+    data class Image(val bytes: ByteArray, val mimeHint: String?) : AttachmentContent()
+    data class Generic(val title: String?, val mime: String?) : AttachmentContent()
+}
+
+private suspend fun decodeAttachment(
+    rec: NoteRecord,
+    fetchAssetBytes: suspend (String) -> ByteArray?,
+    fetchRecord: suspend (String) -> NoteRecord? = { null },
+): AttachmentContent? {
+    val uti = rec.stringField("UTI")?.let {
+        runCatching { kotlin.io.encoding.Base64.decode(it).decodeToString() }.getOrNull()
+    } ?: rec.stringField("UTIEncrypted")?.let {
+        runCatching { kotlin.io.encoding.Base64.decode(it).decodeToString() }.getOrNull()
+    }
+    val title = rec.stringField("TitleEncrypted")?.let {
+        runCatching { kotlin.io.encoding.Base64.decode(it).decodeToString() }.getOrNull()
+    }
+    val mergB64 = rec.stringField("MergeableDataEncrypted")
+    if (mergB64 != null && (uti?.contains("table", ignoreCase = true) == true || title?.equals("Table", ignoreCase = true) == true)) {
+        val grid = com.example.applenotes.proto.MergeableDataDecoder.decodeTableBase64(mergB64)
+        if (grid != null) return AttachmentContent.Table(grid)
+    }
+    // Image attachment — fetch the Media CKAsset.
+    val isImage = uti?.let {
+        it.startsWith("public.png", ignoreCase = true) ||
+            it.startsWith("public.jpeg", ignoreCase = true) ||
+            it.startsWith("public.heic", ignoreCase = true) ||
+            it.startsWith("public.image", ignoreCase = true) ||
+            it.contains("gallery", ignoreCase = true)
+    } == true
+    if (isImage) {
+        // The Attachment record's "Media" is a CKReference to a Media record
+        // which actually carries the binary as a CKAsset. Follow the reference.
+        val mediaField = rec.rawFields["Media"]
+        val mediaRefName = mediaField?.let {
+            com.example.applenotes.client.extractReferenceRecordName(it)
+        }
+        android.util.Log.i("AppleNotesUI", "Image attachment ${rec.recordName}: mediaRef=$mediaRefName uti=$uti")
+        if (mediaRefName != null) {
+            val mediaRec = fetchRecord(mediaRefName)
+            // Media record's asset typically lives in field "MediaEncrypted" or "Media".
+            val candidateFields = listOf("MediaEncrypted", "Media", "Asset", "MediaURL")
+            for (fname in candidateFields) {
+                val candidate = mediaRec?.rawFields?.get(fname) ?: continue
+                val downloadUrl = com.example.applenotes.client.extractAssetDownloadUrl(candidate)
+                if (downloadUrl != null) {
+                    val bytes = fetchAssetBytes(downloadUrl)
+                    if (bytes != null) return AttachmentContent.Image(bytes, uti)
+                }
+            }
+        }
+        // Direct asset URL on this record (rare, but check).
+        val direct = mediaField?.let { com.example.applenotes.client.extractAssetDownloadUrl(it) }
+        if (direct != null) {
+            val bytes = fetchAssetBytes(direct)
+            if (bytes != null) return AttachmentContent.Image(bytes, uti)
+        }
+        // Fall back to the first preview if Media isn't downloadable.
+        val previews = rec.rawFields["PreviewImages"] as? kotlinx.serialization.json.JsonObject
+        val firstPreviewUrl = previews?.get("value")?.let {
+            (it as? kotlinx.serialization.json.JsonArray)?.firstOrNull()
+                ?.let { ele -> com.example.applenotes.client.extractAssetDownloadUrl(ele) }
+        }
+        if (firstPreviewUrl != null) {
+            val bytes = fetchAssetBytes(firstPreviewUrl)
+            if (bytes != null) return AttachmentContent.Image(bytes, uti)
+        }
+    }
+    return AttachmentContent.Generic(title, uti)
+}
+
 @Composable
 private fun FormattedNoteBody(
     fullBody: String,
     titlePrefixLength: Int,
     attrSpans: List<NoteBodyEditor.AttrSpan>,
+    attachmentContent: Map<String, AttachmentContent> = emptyMap(),
     onTap: () -> Unit,
+    onToggleCheckbox: ((paragraphCharStart: Int) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     // Map each char index -> (style, checked). Walk attrSpans in order and
@@ -1324,30 +1539,50 @@ private fun FormattedNoteBody(
             .clickable(onClick = onTap),
     ) {
         var listCounter = 0
-        var lastListStyle: NoteBodyEditor.ParagraphStyle? = null
         for (range in paragraphs) {
-            val rawText = fullBody.substring(range.first, range.last + 1).trimEnd('\n')
+            // Detect an "attachment paragraph" — one whose only visible char is
+            // U+FFFC and whose span carries f12 (attachment_info). Render those
+            // as a labeled card (Table / Image / etc.) instead of inline text.
+            // Mac/iCloud also lay these out as block elements.
+            val attachmentSpan = run {
+                val firstNonNl = (range.first..range.last).firstOrNull {
+                    it < fullBody.length && fullBody[it] != '\n'
+                } ?: return@run null
+                val s = if (firstNonNl < styleAt.size) styleAt[firstNonNl] else null
+                if (s?.isAttachment == true && fullBody[firstNonNl] == '￼') s else null
+            }
+            if (attachmentSpan != null) {
+                val content = attachmentSpan.attachmentRecordName
+                    ?.let { attachmentContent[it] }
+                AttachmentBlock(attachmentSpan, content)
+                continue
+            }
+
             // The dominant style of a paragraph = the style of its first char.
-            val firstStyle = if (range.first < styleAt.size) styleAt[range.first] else null
-            // Treat the very first paragraph (the title line) as TITLE if we
-            // haven't seen a TITLE attribute_run already.
+            val firstSpan = if (range.first < styleAt.size) styleAt[range.first] else null
             val effectiveStyle = when {
                 range.first < titlePrefixLength -> NoteBodyEditor.ParagraphStyle.TITLE
-                firstStyle != null -> firstStyle.style
+                firstSpan != null -> firstSpan.style
                 else -> NoteBodyEditor.ParagraphStyle.BODY
             }
-            // Reset numbered-list counter when the previous para wasn't the
-            // same numbered list.
+            // Reset numbered-list counter when the previous para wasn't part of
+            // the same list.
             if (effectiveStyle != NoteBodyEditor.ParagraphStyle.NUMBERED_LIST) {
                 listCounter = 0
             }
-            lastListStyle = effectiveStyle
+
+            // Build an AnnotatedString for the paragraph's text, applying
+            // per-character bold/italic/underline/strike/link/monospace styling
+            // from each AttrSpan that intersects the paragraph. The newline at
+            // the end of the range is dropped — paragraph spacing is the
+            // wrapper's job.
+            val annotated = buildParagraphAnnotated(fullBody, range, styleAt)
 
             when (effectiveStyle) {
                 NoteBodyEditor.ParagraphStyle.TITLE -> {
-                    if (rawText.isNotEmpty()) {
+                    if (annotated.isNotEmpty()) {
                         Text(
-                            rawText,
+                            annotated,
                             style = MaterialTheme.typography.headlineLarge.copy(
                                 fontWeight = FontWeight.Bold,
                             ),
@@ -1358,7 +1593,7 @@ private fun FormattedNoteBody(
                 }
                 NoteBodyEditor.ParagraphStyle.HEADING -> {
                     Text(
-                        rawText,
+                        annotated,
                         style = MaterialTheme.typography.headlineMedium.copy(
                             fontWeight = FontWeight.SemiBold,
                         ),
@@ -1368,7 +1603,7 @@ private fun FormattedNoteBody(
                 }
                 NoteBodyEditor.ParagraphStyle.SUBHEADING -> {
                     Text(
-                        rawText,
+                        annotated,
                         style = MaterialTheme.typography.titleMedium.copy(
                             fontWeight = FontWeight.SemiBold,
                         ),
@@ -1378,29 +1613,21 @@ private fun FormattedNoteBody(
                 }
                 NoteBodyEditor.ParagraphStyle.MONOSPACED -> {
                     Text(
-                        rawText,
+                        annotated,
                         style = MaterialTheme.typography.bodyMedium.copy(
-                            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                            fontFamily = FontFamily.Monospace,
                         ),
                         color = MaterialTheme.colorScheme.onSurface,
                     )
                 }
                 NoteBodyEditor.ParagraphStyle.BULLETED_LIST -> {
-                    Row(verticalAlignment = Alignment.Top) {
-                        Text(
-                            "•  ",
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        Text(
-                            rawText,
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onSurface,
-                        )
-                    }
+                    BulletRow("•", annotated)
+                }
+                NoteBodyEditor.ParagraphStyle.DASHED_LIST -> {
+                    BulletRow("–", annotated)
                 }
                 NoteBodyEditor.ParagraphStyle.CHECKBOX_LIST -> {
-                    val checked = firstStyle?.checked ?: false
+                    val checked = firstSpan?.checked ?: false
                     Row(verticalAlignment = Alignment.Top) {
                         Icon(
                             if (checked) Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,
@@ -1409,10 +1636,14 @@ private fun FormattedNoteBody(
                                 else MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier
                                 .padding(end = 8.dp, top = 2.dp)
-                                .height(20.dp),
+                                .size(28.dp)
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable(enabled = onToggleCheckbox != null) {
+                                    onToggleCheckbox?.invoke(range.first)
+                                },
                         )
                         Text(
-                            rawText,
+                            annotated,
                             style = MaterialTheme.typography.bodyLarge.copy(
                                 color = if (checked) MaterialTheme.colorScheme.onSurfaceVariant
                                     else MaterialTheme.colorScheme.onSurface,
@@ -1422,25 +1653,14 @@ private fun FormattedNoteBody(
                 }
                 NoteBodyEditor.ParagraphStyle.NUMBERED_LIST -> {
                     listCounter++
-                    Row(verticalAlignment = Alignment.Top) {
-                        Text(
-                            "$listCounter.  ",
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        Text(
-                            rawText,
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onSurface,
-                        )
-                    }
+                    BulletRow("$listCounter.", annotated)
                 }
                 NoteBodyEditor.ParagraphStyle.BODY -> {
-                    if (rawText.isEmpty()) {
+                    if (annotated.isEmpty()) {
                         Spacer(modifier = Modifier.height(12.dp))
                     } else {
                         Text(
-                            rawText,
+                            annotated,
                             style = MaterialTheme.typography.bodyLarge,
                             color = MaterialTheme.colorScheme.onSurface,
                         )
@@ -1456,4 +1676,811 @@ private fun FormattedNoteBody(
             )
         }
     }
+}
+
+@Composable
+private fun AttachmentBlock(span: NoteBodyEditor.AttrSpan, content: AttachmentContent?) {
+    when (content) {
+        is AttachmentContent.Table -> TableGridView(content.grid)
+        is AttachmentContent.Image -> ImageView(content)
+        else -> AttachmentPlaceholder(span)
+    }
+}
+
+@Composable
+private fun TableGridView(grid: com.example.applenotes.proto.MergeableDataDecoder.TableGrid) {
+    val borderColor = MaterialTheme.colorScheme.outlineVariant
+    val headerBg = MaterialTheme.colorScheme.surfaceVariant
+    androidx.compose.foundation.layout.Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp)
+            .background(
+                color = MaterialTheme.colorScheme.surface,
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+            )
+            .androidxBorder(
+                borderColor = borderColor,
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+            ),
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            for ((rIdx, row) in grid.cells.withIndex()) {
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    for ((cIdx, cell) in row.withIndex()) {
+                        val cellModifier = Modifier
+                            .weight(1f)
+                            .background(if (rIdx == 0) headerBg else MaterialTheme.colorScheme.surface)
+                            .padding(horizontal = 12.dp, vertical = 10.dp)
+                        Text(
+                            text = cell,
+                            style = if (rIdx == 0)
+                                MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold)
+                            else
+                                MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = cellModifier,
+                        )
+                        if (cIdx < row.size - 1) {
+                            androidx.compose.foundation.layout.Box(
+                                modifier = Modifier
+                                    .width(1.dp)
+                                    .fillMaxHeight()
+                                    .background(borderColor),
+                            )
+                        }
+                    }
+                }
+                if (rIdx < grid.cells.size - 1) {
+                    HorizontalDivider(color = borderColor)
+                }
+            }
+        }
+    }
+}
+
+private fun Modifier.androidxBorder(
+    borderColor: Color,
+    shape: androidx.compose.ui.graphics.Shape,
+): Modifier = this.border(
+    width = 1.dp,
+    color = borderColor,
+    shape = shape,
+)
+
+@Composable
+private fun ImageView(content: AttachmentContent.Image) {
+    val bitmap = remember(content.bytes) {
+        runCatching {
+            android.graphics.BitmapFactory.decodeByteArray(content.bytes, 0, content.bytes.size)
+        }.getOrNull()
+    }
+    if (bitmap != null) {
+        androidx.compose.foundation.Image(
+            bitmap = bitmap.asImageBitmap(),
+            contentDescription = "Image attachment",
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 6.dp)
+                .background(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+                ),
+        )
+    } else {
+        AttachmentPlaceholder(NoteBodyEditor.AttrSpan(
+            length = 1,
+            style = NoteBodyEditor.ParagraphStyle.BODY,
+            isAttachment = true,
+            attachmentType = content.mimeHint,
+        ))
+    }
+}
+
+@Composable
+private fun AttachmentPlaceholder(span: NoteBodyEditor.AttrSpan) {
+    val (icon, label) = labelForAttachmentType(span.attachmentType)
+    androidx.compose.foundation.layout.Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp)
+            .background(
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+            )
+            .padding(horizontal = 12.dp, vertical = 14.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                icon,
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.padding(end = 10.dp),
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    label,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                val subtitle = span.attachmentType ?: "attachment"
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+private fun labelForAttachmentType(uti: String?): Pair<String, String> = when {
+    uti == null -> "📎" to "Attachment"
+    uti.contains("table", ignoreCase = true) -> "📋" to "Table"
+    uti.contains("gallery", ignoreCase = true) ||
+        uti.contains("image", ignoreCase = true) ||
+        uti.startsWith("public.png", ignoreCase = true) ||
+        uti.startsWith("public.jpeg", ignoreCase = true) ||
+        uti.startsWith("public.heic", ignoreCase = true) -> "🖼" to "Image"
+    uti.contains("sketch", ignoreCase = true) ||
+        uti.contains("drawing", ignoreCase = true) -> "✏️" to "Drawing"
+    uti.contains("map", ignoreCase = true) -> "🗺" to "Map"
+    uti.startsWith("public.url", ignoreCase = true) ||
+        uti.contains("link", ignoreCase = true) -> "🔗" to "Link preview"
+    uti.contains("audio", ignoreCase = true) -> "🎵" to "Audio"
+    uti.contains("video", ignoreCase = true) -> "🎞" to "Video"
+    uti.contains("pdf", ignoreCase = true) -> "📄" to "PDF"
+    else -> "📎" to "Attachment"
+}
+
+@Composable
+private fun BulletRow(marker: String, content: AnnotatedString) {
+    Row(verticalAlignment = Alignment.Top) {
+        Text(
+            "$marker  ",
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            content,
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+    }
+}
+
+/**
+ * Build an AnnotatedString for the chars at [range] in [fullBody], applying
+ * inline styles (bold/italic/underline/strike/link/monospace) from the
+ * AttrSpan covering each char. Coalesces consecutive chars that share an
+ * AttrSpan so we only emit one styled span per run. Drops the trailing
+ * newline if present (paragraphs include their newline; we don't want it
+ * inside the visible text).
+ */
+private fun buildParagraphAnnotated(
+    fullBody: String,
+    range: IntRange,
+    styleAt: Array<NoteBodyEditor.AttrSpan?>,
+): AnnotatedString = buildAnnotatedString {
+    var i = range.first
+    val end = (range.last + 1).coerceAtMost(fullBody.length)
+    while (i < end) {
+        // Skip the trailing newline — only the very last char of the
+        // paragraph range can be '\n', and we don't want it in the rendered
+        // text.
+        if (i == end - 1 && fullBody[i] == '\n') break
+        val span = if (i < styleAt.size) styleAt[i] else null
+        var j = i + 1
+        while (j < end &&
+            !(j == end - 1 && fullBody[j] == '\n') &&
+            (if (j < styleAt.size) styleAt[j] else null) === span
+        ) j++
+        val sub = fullBody.substring(i, j)
+        // U+FFFC stays inline only when the surrounding paragraph isn't
+        // already being rendered as an attachment card (the caller checks
+        // that and skips this codepath); show a small marker so the position
+        // isn't invisible.
+        val display = if (span?.isAttachment == true) sub.replace('￼', '⧉') else sub
+        val style = inlineSpanStyle(span)
+        if (span?.linkUrl != null) {
+            val link = LinkAnnotation.Url(
+                url = span.linkUrl,
+                styles = TextLinkStyles(style = style ?: SpanStyle()),
+            )
+            withLink(link) { append(display) }
+        } else if (style != null) {
+            withStyle(style) { append(display) }
+        } else {
+            append(display)
+        }
+        i = j
+    }
+}
+
+private fun inlineSpanStyle(s: NoteBodyEditor.AttrSpan?): SpanStyle? {
+    if (s == null) return null
+    val decorations = mutableListOf<TextDecoration>()
+    if (s.underline) decorations.add(TextDecoration.Underline)
+    if (s.strikethrough) decorations.add(TextDecoration.LineThrough)
+    val hasInline = s.bold || s.italic || s.underline || s.strikethrough ||
+        s.linkUrl != null || s.style == NoteBodyEditor.ParagraphStyle.MONOSPACED
+    if (!hasInline) return null
+    return SpanStyle(
+        fontWeight = if (s.bold) FontWeight.Bold else null,
+        fontStyle = if (s.italic) FontStyle.Italic else null,
+        textDecoration = when (decorations.size) {
+            0 -> if (s.linkUrl != null) TextDecoration.Underline else null
+            1 -> decorations[0]
+            else -> TextDecoration.combine(decorations)
+        },
+        color = if (s.linkUrl != null) Color(0xFF1A73E8) else Color.Unspecified,
+        fontFamily = if (s.style == NoteBodyEditor.ParagraphStyle.MONOSPACED) FontFamily.Monospace else null,
+    )
+}
+
+@Composable
+private fun FormattingToolbar(
+    titlePrefixLength: Int,
+    bodyValue: androidx.compose.ui.text.input.TextFieldValue,
+    fullBody: String,
+    spans: List<NoteBodyEditor.AttrSpan>,
+    onSpansChange: (List<NoteBodyEditor.AttrSpan>) -> Unit,
+) {
+    // Map body-relative selection → full-body coordinates.
+    val sel = bodyValue.selection
+    val rangeStart = (sel.min + titlePrefixLength).coerceIn(0, fullBody.length)
+    val rangeEnd = (sel.max + titlePrefixLength).coerceIn(rangeStart, fullBody.length)
+    val effectiveEnd = if (rangeEnd == rangeStart) {
+        // No selection — apply to the paragraph of the cursor for paragraph
+        // styles, and to a one-char neighborhood for inline (handled via
+        // selectionExtended below).
+        rangeEnd
+    } else rangeEnd
+
+    val perChar = remember(fullBody, spans) { NoteBodyEditor.expandSpansToChars(fullBody, spans) }
+    val curSpan = if (rangeStart < perChar.size) perChar[rangeStart]
+        else if (perChar.isNotEmpty()) perChar.last() else null
+    // For "is this format on right now?" indicators: collapsed cursor uses the
+    // span at the cursor; selection uses "is every char in selection on?".
+    fun allHave(predicate: (NoteBodyEditor.AttrSpan) -> Boolean): Boolean {
+        if (rangeStart >= rangeEnd) return curSpan?.let(predicate) == true
+        for (i in rangeStart until rangeEnd) if (i in perChar.indices && !predicate(perChar[i])) return false
+        return true
+    }
+    val isBold = allHave { it.bold }
+    val isItalic = allHave { it.italic }
+    val isUnderline = allHave { it.underline }
+    val isStrike = allHave { it.strikethrough }
+    val curStyle = curSpan?.style ?: NoteBodyEditor.ParagraphStyle.BODY
+
+    val context = LocalContext.current
+
+    // Style picker dropdown state.
+    var styleMenuOpen by remember { mutableStateOf(false) }
+    var linkDialogOpen by remember { mutableStateOf(false) }
+
+    Surface(
+        tonalElevation = 3.dp,
+        shadowElevation = 0.dp,
+        color = MaterialTheme.colorScheme.surface,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column {
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                // Paragraph-style picker.
+                ToolbarPill(
+                    label = paragraphStyleLabel(curStyle),
+                    icon = "Aa",
+                    selected = curStyle != NoteBodyEditor.ParagraphStyle.BODY,
+                    onClick = { styleMenuOpen = true },
+                )
+                DropdownMenu(
+                    expanded = styleMenuOpen,
+                    onDismissRequest = { styleMenuOpen = false },
+                ) {
+                    listOf(
+                        NoteBodyEditor.ParagraphStyle.TITLE,
+                        NoteBodyEditor.ParagraphStyle.HEADING,
+                        NoteBodyEditor.ParagraphStyle.SUBHEADING,
+                        NoteBodyEditor.ParagraphStyle.BODY,
+                        NoteBodyEditor.ParagraphStyle.MONOSPACED,
+                    ).forEach { style ->
+                        DropdownMenuItem(
+                            text = { Text(paragraphStyleLabel(style)) },
+                            trailingIcon = {
+                                if (curStyle == style) Icon(Icons.Default.Check, null)
+                            },
+                            onClick = {
+                                styleMenuOpen = false
+                                onSpansChange(NoteBodyEditor.setParagraphStyle(
+                                    fullBody, spans, rangeStart, rangeEnd.coerceAtLeast(rangeStart + 1), style,
+                                ))
+                            },
+                        )
+                    }
+                }
+
+                ToolbarDivider()
+
+                // List paragraph styles.
+                ToolbarIconButton(
+                    icon = Icons.AutoMirrored.Filled.FormatListBulleted,
+                    contentDescription = "Bulleted list",
+                    selected = curStyle == NoteBodyEditor.ParagraphStyle.BULLETED_LIST,
+                    onClick = {
+                        val target = if (curStyle == NoteBodyEditor.ParagraphStyle.BULLETED_LIST)
+                            NoteBodyEditor.ParagraphStyle.BODY
+                        else NoteBodyEditor.ParagraphStyle.BULLETED_LIST
+                        onSpansChange(NoteBodyEditor.setParagraphStyle(
+                            fullBody, spans, rangeStart, rangeEnd.coerceAtLeast(rangeStart + 1), target,
+                        ))
+                    },
+                )
+                ToolbarIconButton(
+                    icon = Icons.Filled.HorizontalRule,
+                    contentDescription = "Dashed list",
+                    selected = curStyle == NoteBodyEditor.ParagraphStyle.DASHED_LIST,
+                    onClick = {
+                        val target = if (curStyle == NoteBodyEditor.ParagraphStyle.DASHED_LIST)
+                            NoteBodyEditor.ParagraphStyle.BODY
+                        else NoteBodyEditor.ParagraphStyle.DASHED_LIST
+                        onSpansChange(NoteBodyEditor.setParagraphStyle(
+                            fullBody, spans, rangeStart, rangeEnd.coerceAtLeast(rangeStart + 1), target,
+                        ))
+                    },
+                )
+                ToolbarIconButton(
+                    icon = Icons.Filled.FormatListNumbered,
+                    contentDescription = "Numbered list",
+                    selected = curStyle == NoteBodyEditor.ParagraphStyle.NUMBERED_LIST,
+                    onClick = {
+                        val target = if (curStyle == NoteBodyEditor.ParagraphStyle.NUMBERED_LIST)
+                            NoteBodyEditor.ParagraphStyle.BODY
+                        else NoteBodyEditor.ParagraphStyle.NUMBERED_LIST
+                        onSpansChange(NoteBodyEditor.setParagraphStyle(
+                            fullBody, spans, rangeStart, rangeEnd.coerceAtLeast(rangeStart + 1), target,
+                        ))
+                    },
+                )
+                ToolbarIconButton(
+                    icon = Icons.Filled.CheckBoxOutlineBlank,
+                    contentDescription = "Checkbox",
+                    selected = curStyle == NoteBodyEditor.ParagraphStyle.CHECKBOX_LIST,
+                    onClick = {
+                        val target = if (curStyle == NoteBodyEditor.ParagraphStyle.CHECKBOX_LIST)
+                            NoteBodyEditor.ParagraphStyle.BODY
+                        else NoteBodyEditor.ParagraphStyle.CHECKBOX_LIST
+                        onSpansChange(NoteBodyEditor.setParagraphStyle(
+                            fullBody, spans, rangeStart, rangeEnd.coerceAtLeast(rangeStart + 1), target,
+                        ))
+                    },
+                )
+
+                ToolbarDivider()
+
+                // Inline format toggles.
+                ToolbarIconButton(
+                    icon = Icons.Filled.FormatBold,
+                    contentDescription = "Bold",
+                    selected = isBold,
+                    onClick = {
+                        if (rangeStart < rangeEnd) {
+                            onSpansChange(NoteBodyEditor.toggleInline(
+                                fullBody, spans, rangeStart, rangeEnd, NoteBodyEditor.InlineKind.BOLD,
+                            ))
+                        }
+                    },
+                )
+                ToolbarIconButton(
+                    icon = Icons.Filled.FormatItalic,
+                    contentDescription = "Italic",
+                    selected = isItalic,
+                    onClick = {
+                        if (rangeStart < rangeEnd) {
+                            onSpansChange(NoteBodyEditor.toggleInline(
+                                fullBody, spans, rangeStart, rangeEnd, NoteBodyEditor.InlineKind.ITALIC,
+                            ))
+                        }
+                    },
+                )
+                ToolbarIconButton(
+                    icon = Icons.Filled.FormatUnderlined,
+                    contentDescription = "Underline",
+                    selected = isUnderline,
+                    onClick = {
+                        if (rangeStart < rangeEnd) {
+                            onSpansChange(NoteBodyEditor.toggleInline(
+                                fullBody, spans, rangeStart, rangeEnd, NoteBodyEditor.InlineKind.UNDERLINE,
+                            ))
+                        }
+                    },
+                )
+                ToolbarIconButton(
+                    icon = Icons.Filled.FormatStrikethrough,
+                    contentDescription = "Strikethrough",
+                    selected = isStrike,
+                    onClick = {
+                        if (rangeStart < rangeEnd) {
+                            onSpansChange(NoteBodyEditor.toggleInline(
+                                fullBody, spans, rangeStart, rangeEnd, NoteBodyEditor.InlineKind.STRIKETHROUGH,
+                            ))
+                        }
+                    },
+                )
+
+                ToolbarDivider()
+
+                // Link.
+                ToolbarIconButton(
+                    icon = Icons.Filled.Link,
+                    contentDescription = "Link",
+                    selected = curSpan?.linkUrl != null,
+                    onClick = { linkDialogOpen = true },
+                )
+            }
+        }
+    }
+
+    if (linkDialogOpen) {
+        var urlText by remember { mutableStateOf(curSpan?.linkUrl ?: "https://") }
+        AlertDialog(
+            onDismissRequest = { linkDialogOpen = false },
+            title = { Text("Add link") },
+            text = {
+                OutlinedTextField(
+                    value = urlText,
+                    onValueChange = { urlText = it },
+                    label = { Text("URL") },
+                    singleLine = true,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    linkDialogOpen = false
+                    if (rangeStart < rangeEnd) {
+                        onSpansChange(NoteBodyEditor.setLink(
+                            fullBody, spans, rangeStart, rangeEnd, urlText.takeIf { it.isNotBlank() },
+                        ))
+                    }
+                }) { Text("Apply") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    linkDialogOpen = false
+                    if (rangeStart < rangeEnd && curSpan?.linkUrl != null) {
+                        onSpansChange(NoteBodyEditor.setLink(fullBody, spans, rangeStart, rangeEnd, null))
+                    }
+                }) { Text(if (curSpan?.linkUrl != null) "Remove" else "Cancel") }
+            },
+        )
+    }
+}
+
+private fun paragraphStyleLabel(style: NoteBodyEditor.ParagraphStyle): String = when (style) {
+    NoteBodyEditor.ParagraphStyle.TITLE -> "Title"
+    NoteBodyEditor.ParagraphStyle.HEADING -> "Heading"
+    NoteBodyEditor.ParagraphStyle.SUBHEADING -> "Subheading"
+    NoteBodyEditor.ParagraphStyle.BODY -> "Body"
+    NoteBodyEditor.ParagraphStyle.MONOSPACED -> "Monospaced"
+    NoteBodyEditor.ParagraphStyle.BULLETED_LIST -> "Bulleted"
+    NoteBodyEditor.ParagraphStyle.DASHED_LIST -> "Dashed"
+    NoteBodyEditor.ParagraphStyle.NUMBERED_LIST -> "Numbered"
+    NoteBodyEditor.ParagraphStyle.CHECKBOX_LIST -> "Checkbox"
+}
+
+@Composable
+private fun ToolbarPill(
+    label: String,
+    icon: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    val bg by animateColorAsState(
+        if (selected) MaterialTheme.colorScheme.primaryContainer
+        else MaterialTheme.colorScheme.surfaceContainerHigh,
+        label = "pillBg",
+    )
+    val fg by animateColorAsState(
+        if (selected) MaterialTheme.colorScheme.onPrimaryContainer
+        else MaterialTheme.colorScheme.onSurface,
+        label = "pillFg",
+    )
+    androidx.compose.foundation.layout.Box(
+        modifier = Modifier
+            .height(40.dp)
+            .clip(RoundedCornerShape(20.dp))
+            .background(bg)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                icon,
+                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+                color = fg,
+                modifier = Modifier.padding(end = 8.dp),
+            )
+            Text(
+                label,
+                style = MaterialTheme.typography.labelLarge,
+                color = fg,
+            )
+            Icon(
+                Icons.Filled.ArrowDropDown,
+                contentDescription = null,
+                tint = fg,
+                modifier = Modifier.size(18.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ToolbarIconButton(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    contentDescription: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    val bg by animateColorAsState(
+        if (selected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
+        label = "iconBg",
+    )
+    val fg by animateColorAsState(
+        if (selected) MaterialTheme.colorScheme.onPrimaryContainer
+        else MaterialTheme.colorScheme.onSurface,
+        label = "iconFg",
+    )
+    androidx.compose.foundation.layout.Box(
+        modifier = Modifier
+            .size(40.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(bg)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = contentDescription,
+            tint = fg,
+            modifier = Modifier.size(22.dp),
+        )
+    }
+}
+
+@Composable
+private fun ToolbarDivider() {
+    androidx.compose.foundation.layout.Box(
+        modifier = Modifier
+            .padding(horizontal = 4.dp)
+            .width(1.dp)
+            .height(24.dp)
+            .background(MaterialTheme.colorScheme.outlineVariant),
+    )
+}
+
+/**
+ * VisualTransformation that styles a plaintext body in real-time as the user
+ * types. Inline runs (bold/italic/underline/strike/link/monospace) get
+ * SpanStyles; heading paragraphs get a bigger fontSize. List paragraphs
+ * (bulleted/dashed/numbered/checkbox) get a visible marker prefix that's not
+ * part of the underlying text — the OffsetMapping skips it so the cursor and
+ * selection stay aligned with the raw chars.
+ *
+ * Limits we accept (vs. true block-by-block layout):
+ *  - Markers are inline characters, not Compose Icons. Looks reasonable
+ *    using "•", "–", "1.", "☐", "☑".
+ *  - Heading sizes via SpanStyle.fontSize, no per-paragraph block padding.
+ *  - Tables/images render as their U+FFFC placeholder still — block-level
+ *    embeds aren't possible inside a single BasicTextField.
+ */
+private class FormattingVisualTransformation(
+    private val spans: List<NoteBodyEditor.AttrSpan>,
+) : androidx.compose.ui.text.input.VisualTransformation {
+
+    override fun filter(text: AnnotatedString): androidx.compose.ui.text.input.TransformedText {
+        val raw = text.text
+        val perChar = NoteBodyEditor.expandSpansToChars(raw, spans)
+        val builder = AnnotatedString.Builder()
+        // Per-raw-index running insertion offset: rawToTransformed[i] = position
+        // in the displayed string corresponding to raw char i.
+        val rawToTransformed = IntArray(raw.length + 1)
+        var added = 0
+        var listCounter = 0
+
+        var i = 0
+        while (i <= raw.length) {
+            rawToTransformed[i] = i + added
+            if (i == raw.length) break
+
+            // At a paragraph start (idx 0 or just after a \n), maybe inject a
+            // marker that visually represents the paragraph style.
+            val isParaStart = i == 0 || raw[i - 1] == '\n'
+            if (isParaStart) {
+                val span = perChar.getOrNull(i)
+                val style = span?.style ?: NoteBodyEditor.ParagraphStyle.BODY
+                if (style == NoteBodyEditor.ParagraphStyle.NUMBERED_LIST) {
+                    listCounter++
+                } else {
+                    listCounter = 0
+                }
+                val prefix = when (style) {
+                    NoteBodyEditor.ParagraphStyle.BULLETED_LIST -> "•  "
+                    NoteBodyEditor.ParagraphStyle.DASHED_LIST -> "–  "
+                    NoteBodyEditor.ParagraphStyle.NUMBERED_LIST -> "$listCounter.  "
+                    NoteBodyEditor.ParagraphStyle.CHECKBOX_LIST ->
+                        if (span?.checked == true) "☑  " else "☐  "
+                    else -> ""
+                }
+                if (prefix.isNotEmpty()) {
+                    builder.withStyle(SpanStyle(color = MARKER_COLOR)) {
+                        append(prefix)
+                    }
+                    added += prefix.length
+                    rawToTransformed[i] = i + added
+                }
+            }
+
+            // Group consecutive chars sharing a span (and not crossing
+            // paragraph boundaries) and emit them with a single style block.
+            var j = i + 1
+            while (j < raw.length && raw[j - 1] != '\n' &&
+                perChar.getOrNull(j) === perChar.getOrNull(i)
+            ) j++
+            val span = perChar.getOrNull(i)
+            val sub = raw.substring(i, j)
+            val style = paragraphSpanStyle(span) merge inlineSpanStyle(span)
+            if (style != null) {
+                builder.withStyle(style) { append(sub) }
+            } else {
+                builder.append(sub)
+            }
+            // Fill rawToTransformed for chars in (i..j].
+            for (k in i + 1..j) rawToTransformed[k] = k + added
+            i = j
+        }
+
+        return androidx.compose.ui.text.input.TransformedText(
+            builder.toAnnotatedString(),
+            object : androidx.compose.ui.text.input.OffsetMapping {
+                override fun originalToTransformed(offset: Int): Int =
+                    rawToTransformed[offset.coerceIn(0, raw.length)]
+
+                override fun transformedToOriginal(offset: Int): Int {
+                    // First raw index whose transformed offset >= offset.
+                    var lo = 0
+                    var hi = raw.length
+                    while (lo < hi) {
+                        val mid = (lo + hi) ushr 1
+                        if (rawToTransformed[mid] < offset) lo = mid + 1 else hi = mid
+                    }
+                    return lo
+                }
+            },
+        )
+    }
+
+    private fun paragraphSpanStyle(s: NoteBodyEditor.AttrSpan?): SpanStyle? {
+        if (s == null) return null
+        return when (s.style) {
+            NoteBodyEditor.ParagraphStyle.TITLE ->
+                SpanStyle(fontSize = 28.sp, fontWeight = FontWeight.Bold)
+            NoteBodyEditor.ParagraphStyle.HEADING ->
+                SpanStyle(fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+            NoteBodyEditor.ParagraphStyle.SUBHEADING ->
+                SpanStyle(fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+            NoteBodyEditor.ParagraphStyle.MONOSPACED ->
+                SpanStyle(fontFamily = FontFamily.Monospace)
+            NoteBodyEditor.ParagraphStyle.CHECKBOX_LIST ->
+                if (s.checked) SpanStyle(textDecoration = TextDecoration.LineThrough)
+                else null
+            else -> null
+        }
+    }
+
+    /** SpanStyle merge — non-null fields of [other] win. */
+    private infix fun SpanStyle?.merge(other: SpanStyle?): SpanStyle? = when {
+        this == null -> other
+        other == null -> this
+        else -> this.merge(other)
+    }
+
+    companion object {
+        private val MARKER_COLOR = Color(0xFF8A8A8A)
+    }
+}
+
+/**
+ * Re-align an AttrSpan list with edited text. Approach: longest-common-prefix
+ * + longest-common-suffix diff; chars in the deleted middle are removed from
+ * the per-char span array; chars in the inserted middle inherit the format of
+ * the char immediately before the cut (or default body if at the start).
+ *
+ * Imperfect but good enough — handles typing/backspace/IME composition
+ * without losing existing formatting on either side.
+ */
+internal fun syncSpansToText(
+    oldText: String,
+    oldSpans: List<NoteBodyEditor.AttrSpan>,
+    newText: String,
+): List<NoteBodyEditor.AttrSpan> {
+    if (oldText == newText) return oldSpans
+    val perChar = NoteBodyEditor.expandSpansToChars(oldText, oldSpans)
+    var lcp = 0
+    val maxPrefix = minOf(oldText.length, newText.length)
+    while (lcp < maxPrefix && oldText[lcp] == newText[lcp]) lcp++
+    var lcs = 0
+    val maxSuffix = minOf(oldText.length - lcp, newText.length - lcp)
+    while (lcs < maxSuffix &&
+        oldText[oldText.length - 1 - lcs] == newText[newText.length - 1 - lcs]) lcs++
+    val deletedRange = lcp until (oldText.length - lcs)
+    val insertedLen = newText.length - lcp - lcs
+
+    val template = (perChar.getOrNull(lcp - 1) ?: perChar.firstOrNull())
+        ?.copy(length = 1)
+        ?: NoteBodyEditor.AttrSpan(length = 1, style = NoteBodyEditor.ParagraphStyle.BODY)
+
+    val newPerChar = ArrayList<NoteBodyEditor.AttrSpan>(newText.length)
+    for (i in 0 until lcp) newPerChar.add(perChar[i])
+    repeat(insertedLen) {
+        // Newly inserted chars carry inline formatting from the previous char,
+        // but reset to BODY paragraph style if the insert begins on or after a
+        // paragraph break (avoids accidentally extending a Heading run when
+        // hitting Enter at end of line).
+        val carry = if (template.style == NoteBodyEditor.ParagraphStyle.TITLE ||
+            template.style == NoteBodyEditor.ParagraphStyle.HEADING ||
+            template.style == NoteBodyEditor.ParagraphStyle.SUBHEADING) {
+            template.copy(style = NoteBodyEditor.ParagraphStyle.BODY)
+        } else template
+        newPerChar.add(carry)
+    }
+    for (i in (oldText.length - lcs) until oldText.length) newPerChar.add(perChar[i])
+    if (newPerChar.size != newText.length) {
+        // Defensive — return a single body span covering the whole new text.
+        return listOf(NoteBodyEditor.AttrSpan(
+            length = newText.length, style = NoteBodyEditor.ParagraphStyle.BODY,
+        ))
+    }
+    return NoteBodyEditor.compactCharsToSpans(newPerChar.toTypedArray())
+}
+
+/**
+ * Drop the first [skipChars] characters' worth of attribute spans, splitting
+ * the boundary span if the cut falls inside one. Used to align spans parsed
+ * from the full visible body (which includes the title line) with the body
+ * text we render below the app bar.
+ */
+private fun attrSpansAfter(
+    spans: List<NoteBodyEditor.AttrSpan>,
+    skipChars: Int,
+): List<NoteBodyEditor.AttrSpan> {
+    if (skipChars <= 0) return spans
+    val out = mutableListOf<NoteBodyEditor.AttrSpan>()
+    var consumed = 0
+    for (s in spans) {
+        if (out.isNotEmpty()) {
+            out.add(s)
+            continue
+        }
+        val end = consumed + s.length
+        when {
+            end <= skipChars -> consumed = end
+            consumed >= skipChars -> out.add(s)
+            else -> {
+                out.add(s.copy(length = end - skipChars))
+                consumed = end
+            }
+        }
+    }
+    return out
 }

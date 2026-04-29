@@ -553,6 +553,7 @@ object NoteAppender {
         ourReplicaUuid: ByteArray,
         newFullBody: String,
         nowEpochSec: Long,
+        newSpans: List<NoteBodyEditor.AttrSpan>? = null,
     ): String {
         require(ourReplicaUuid.size == 16) { "ourReplicaUuid must be 16 bytes" }
         val compressed = Base64.decode(textDataEncryptedB64)
@@ -560,7 +561,7 @@ object NoteAppender {
         val proto = Gzip.decompress(compressed)
         Log.i(TAG, "setBodyBase64 IN: bodyLen=${newFullBody.length} protoLen=${proto.size} format=$format")
         Log.i(TAG, "setBodyBase64 IN  proto: ${NoteBodyEditor.summarize(proto)}")
-        val newProto = setBodyBytes(proto, ourReplicaUuid, newFullBody, nowEpochSec)
+        val newProto = setBodyBytes(proto, ourReplicaUuid, newFullBody, nowEpochSec, newSpans)
         Log.i(TAG, "setBodyBase64 OUT proto: ${NoteBodyEditor.summarize(newProto)}")
         val newCompressed = Gzip.compress(newProto, format)
         return Base64.encode(newCompressed)
@@ -571,7 +572,8 @@ object NoteAppender {
         ourReplicaUuid: ByteArray,
         newFullBody: String,
         nowEpochSec: Long,
-    ): ByteArray = setBodySpliceBytes(protoBytes, ourReplicaUuid, newFullBody, nowEpochSec)
+        newSpans: List<NoteBodyEditor.AttrSpan>? = null,
+    ): ByteArray = setBodySpliceBytes(protoBytes, ourReplicaUuid, newFullBody, nowEpochSec, newSpans)
 
     /**
      * Splice-based mid-edit. Mirrors iCloud.com's pattern verified by capturing
@@ -601,11 +603,53 @@ object NoteAppender {
      *     fidelity is a TODO; visible text correctness comes first).
      * 10. Bump our replica's counter1 by insertText.length.
      */
+    /**
+     * Format-only change path: keep the proto's substring tree intact and
+     * just rewrite the attribute_runs to match [newSpans]. Used when the
+     * user toggles bold/heading/etc. without changing any characters.
+     */
+    private fun rewriteAttributeRunsOnly(
+        protoBytes: ByteArray,
+        newSpans: List<NoteBodyEditor.AttrSpan>,
+        bodyText: String,
+    ): ByteArray {
+        val coalesced = NoteBodyEditor.coalesceSpans(newSpans)
+        if (coalesced.sumOf { it.length } != bodyText.length) {
+            Log.w(TAG, "rewriteARsOnly: span sum=${coalesced.sumOf { it.length }} != body=${bodyText.length}; skipping")
+            return protoBytes
+        }
+        val top = ProtobufWire.decode(protoBytes).toMutableList()
+        val versionIdx = top.indexOfFirst {
+            it.fieldNumber == FIELD_OUTER_VERSION && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        require(versionIdx >= 0)
+        val versionFields = ProtobufWire.decode(top[versionIdx].payload).toMutableList()
+        val dataIdx = versionFields.indexOfFirst {
+            it.fieldNumber == FIELD_VERSION_DATA && it.wireType == ProtobufWire.WIRE_LENGTH_DELIM
+        }
+        require(dataIdx >= 0)
+        val stringFields = ProtobufWire.decode(versionFields[dataIdx].payload).toMutableList()
+
+        // Drop existing AR fields, keep everything else, append new AR fields.
+        val rebuilt = ArrayList<ProtobufWire.Field>(stringFields.size)
+        for (f in stringFields) {
+            if (f.fieldNumber == FIELD_STRING_ATTRIBUTE_RUN && f.wireType == ProtobufWire.WIRE_LENGTH_DELIM) continue
+            rebuilt.add(f)
+        }
+        for (s in coalesced) rebuilt.add(NoteBodyEditor.encodeAttributeRunField(s))
+
+        versionFields[dataIdx] = versionFields[dataIdx].copy(payload = ProtobufWire.encode(rebuilt))
+        top[versionIdx] = top[versionIdx].copy(payload = ProtobufWire.encode(versionFields))
+        Log.i(TAG, "rewriteARsOnly: emitted ${coalesced.size} spans")
+        return ProtobufWire.encode(top)
+    }
+
     fun setBodySpliceBytes(
         protoBytes: ByteArray,
         ourReplicaUuid: ByteArray,
         newFullBody: String,
         nowEpochSec: Long,
+        newSpans: List<NoteBodyEditor.AttrSpan>? = null,
     ): ByteArray {
         require(ourReplicaUuid.size == 16)
         val kind = NoteBodyEditor.probe(protoBytes)
@@ -705,9 +749,15 @@ object NoteAppender {
             }
         }
         val currentVisible = visibleSb.toString()
-        if (currentVisible == newFullBody) {
+        if (currentVisible == newFullBody && newSpans == null) {
             Log.i(TAG, "setBodySplice: no-op (current visible matches target)")
             return protoBytes
+        }
+        if (currentVisible == newFullBody && newSpans != null) {
+            // Format-only change — text unchanged but spans differ. Take a
+            // shortcut: re-encode just the attribute_runs into the existing
+            // proto, without splicing the substring tree.
+            return rewriteAttributeRunsOnly(protoBytes, newSpans, newFullBody)
         }
         Log.i(
             TAG,
@@ -1060,6 +1110,24 @@ object NoteAppender {
         Log.i(TAG, "splice attribute_runs: orig=${origARFields.size} new=${newARs.size} " +
                 "(prefix=$prefixLen insert=${insertText.length} suffix=$suffixLen)")
 
+        // If the caller provided explicit new spans (formatting changes), use
+        // those — encoded fresh — instead of the AR-preservation path. We
+        // still ran the splice above to keep the substring tree right; this
+        // just overrides what attribute_runs we emit.
+        val effectiveARs = if (newSpans != null) {
+            val coalesced = NoteBodyEditor.coalesceSpans(newSpans)
+            // Sanity: span lengths must sum to the visible body length.
+            val sum = coalesced.sumOf { it.length }
+            if (sum != newFullBody.length) {
+                Log.w(TAG, "newSpans length sum=$sum != body=${newFullBody.length}; using splice ARs")
+                newARs
+            } else {
+                ArrayList<ProtobufWire.Field>().apply {
+                    coalesced.forEach { add(NoteBodyEditor.encodeAttributeRunField(it)) }
+                }
+            }
+        } else newARs
+
         val rebuiltStringFields = ArrayList<ProtobufWire.Field>()
         rebuiltStringFields.add(
             ProtobufWire.Field(
@@ -1076,7 +1144,7 @@ object NoteAppender {
                 ProtobufWire.encode(vtFields),
             ),
         )
-        rebuiltStringFields.addAll(newARs)
+        rebuiltStringFields.addAll(effectiveARs)
         // Preserve any other fields we don't touch (e.g., attachments at field 6).
         for (f in stringFields) {
             when (f.fieldNumber) {

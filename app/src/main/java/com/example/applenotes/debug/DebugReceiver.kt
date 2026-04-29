@@ -153,6 +153,75 @@ class DebugReceiver : BroadcastReceiver() {
                     }
                 }
             }
+            ACTION_DUMP_RECORD -> {
+                val recordName = intent.getStringExtra("recordName")
+                if (recordName == null) {
+                    Log.e(TAG, "DUMP_RECORD missing recordName")
+                    return
+                }
+                launchOp("DUMP_RECORD") { client, _ ->
+                    val record = client.lookupNote(recordName)
+                    Log.i(TAG, "DUMP_RECORD type=${record.recordType} tag=${record.recordChangeTag}")
+                    for ((name, _) in record.rawFields) {
+                        val s = record.stringField(name)
+                        if (s == null) continue
+                        Log.i(TAG, "FIELD $name (b64.len=${s.length})")
+                        val chunkSize = 800
+                        val chunks = (s.length + chunkSize - 1) / chunkSize
+                        for (i in 0 until chunks) {
+                            val start = i * chunkSize
+                            val end = minOf(start + chunkSize, s.length)
+                            Log.i(TAG, "FIELD_B64 $name [$i/$chunks] ${s.substring(start, end)}")
+                        }
+                    }
+                }
+            }
+            ACTION_DUMP_BY_TITLE -> {
+                val title = intent.getStringExtra("title")
+                if (title == null) {
+                    Log.e(TAG, "DUMP_BY_TITLE missing title")
+                    return
+                }
+                launchOp("DUMP_BY_TITLE") { client, _ ->
+                    val match = findByTitle(client, title)
+                    if (match == null) {
+                        Log.w(TAG, "DUMP_BY_TITLE_NOT_FOUND title='$title'")
+                    } else {
+                        Log.i(TAG, "DUMP_BY_TITLE_FOUND '$title' -> ${match.recordName}")
+                        val record = client.lookupNote(match.recordName)
+                        val b64 = record.stringField("TextDataEncrypted")
+                        if (b64 == null) {
+                            Log.w(TAG, "DUMP_BY_TITLE_NO_BODY")
+                        } else {
+                            Log.i(TAG, "DUMP_KIND ${NoteBodyEditor.probeBase64(b64)}")
+                            // Log b64 in 1KB chunks so logcat doesn't truncate.
+                            val chunkSize = 800
+                            val chunks = (b64.length + chunkSize - 1) / chunkSize
+                            Log.i(TAG, "DUMP_B64_BEGIN total=${b64.length} chunks=$chunks")
+                            for (i in 0 until chunks) {
+                                val start = i * chunkSize
+                                val end = minOf(start + chunkSize, b64.length)
+                                Log.i(TAG, "DUMP_B64[$i/$chunks] ${b64.substring(start, end)}")
+                            }
+                            Log.i(TAG, "DUMP_B64_END")
+                            Log.i(TAG, "DUMP_SUMMARY ${NoteBodyEditor.summarizeBase64(b64)}")
+                            // describeBase64 is multi-line; split for logcat.
+                            val desc = NoteBodyEditor.describeBase64(b64)
+                            Log.i(TAG, "DUMP_DESCRIBE_BEGIN")
+                            for (line in desc.lines()) Log.i(TAG, "DESC $line")
+                            Log.i(TAG, "DUMP_DESCRIBE_END")
+                            val ar = NoteBodyEditor.dumpAttributeRunsBase64(b64)
+                            Log.i(TAG, "DUMP_ATTRRUNS_BEGIN")
+                            for (line in ar.lines()) Log.i(TAG, "AR $line")
+                            Log.i(TAG, "DUMP_ATTRRUNS_END")
+                            val tree = NoteBodyEditor.dumpSubstringTreeBase64(b64)
+                            Log.i(TAG, "DUMP_TREE_BEGIN")
+                            for (line in tree.lines()) Log.i(TAG, "TREE $line")
+                            Log.i(TAG, "DUMP_TREE_END")
+                        }
+                    }
+                }
+            }
             ACTION_CREATE -> {
                 val title = intent.getStringExtra("title") ?: ""
                 val body = intent.getStringExtra("body") ?: ""
@@ -275,6 +344,8 @@ class DebugReceiver : BroadcastReceiver() {
         private const val ACTION_APPEND_BY_TITLE = "com.example.applenotes.APPEND_BY_TITLE"
         private const val ACTION_SET_BODY_BY_TITLE = "com.example.applenotes.SET_BODY_BY_TITLE"
         private const val ACTION_DELETE_BY_TITLE = "com.example.applenotes.DELETE_BY_TITLE"
+        private const val ACTION_DUMP_BY_TITLE = "com.example.applenotes.DUMP_BY_TITLE"
+        private const val ACTION_DUMP_RECORD = "com.example.applenotes.DUMP_RECORD"
         private const val ACTION_CREATE = "com.example.applenotes.CREATE"
 
         private val httpClient by lazy {
