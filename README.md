@@ -13,6 +13,12 @@ Grab a signed APK from the [Releases page](../../releases) and side-load it onto
 Android 8.0+ device. Each release's notes link back to the disclaimer below;
 read it first.
 
+> **Note for early v0.0.1 users:** v0.0.1 was signed with an unstable CI key,
+> so upgrading directly to v0.0.2+ will fail with "Something went wrong / app
+> could not be installed." **Uninstall v0.0.1 first**, then install v0.0.2.
+> From v0.0.2 onwards every release uses a pinned project-owned key, so
+> future upgrades install cleanly.
+
 If you'd rather build from source, see [Build / run](#build--run) further down.
 
 ## ⚠️ Use at your own risk

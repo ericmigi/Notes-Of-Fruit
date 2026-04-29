@@ -15,17 +15,30 @@ android {
         versionName = "0.0.2"
     }
 
+    signingConfigs {
+        // Stable project-owned keystore so every release-tagged build is
+        // signed with the SAME key. Without this, GH Actions generates a
+        // fresh ~/.android/debug.keystore per runner and users can't upgrade
+        // across releases (Android rejects an APK update with a different
+        // signing certificate).
+        //
+        // Password is committed alongside the keystore on purpose — this is
+        // an alpha self-signed cert, not a Play Store key. Anyone who can
+        // pull the repo can rebuild & sign their own APK; that's the
+        // expected level of trust for a research project.
+        create("releaseAlpha") {
+            storeFile = file("keystore/release.keystore")
+            storePassword = "notesoffruit"
+            keyAlias = "notes-of-fruit"
+            keyPassword = "notesoffruit"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            // Sign release builds with the debug key so the APK is installable
-            // out of the GH Actions artifact without managing keystore secrets.
-            // The trade-off: a future "real" release that wants Play Store
-            // distribution must rotate to a fresh keystore, which orphans
-            // earlier installs (Android won't auto-update across keystores).
-            // That's acceptable for an alpha.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("releaseAlpha")
         }
     }
     compileOptions {
