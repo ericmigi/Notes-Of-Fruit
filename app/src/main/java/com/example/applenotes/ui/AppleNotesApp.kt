@@ -682,6 +682,11 @@ private fun NotesListScreen(
     }
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val drawerScope = rememberCoroutineScope()
+    // System back closes the drawer if it's open; otherwise let it fall
+    // through (the activity-default behaviour exits the app from the list).
+    androidx.activity.compose.BackHandler(enabled = drawerState.isOpen) {
+        drawerScope.launch { drawerState.close() }
+    }
     val selectedFolderName = remember(selectedFolder, folders) {
         when (selectedFolder) {
             null -> "All notes"
@@ -1217,6 +1222,14 @@ private fun NoteDetailScreen(
         } else {
             onBack()
         }
+    }
+
+    // Intercept the system back button / gesture so it navigates to the list
+    // instead of closing the activity. Mirrors the back-arrow's behaviour
+    // (save-if-modified, then exit). Disabled while saving so a tap on
+    // "Save" → back doesn't fire twice.
+    androidx.activity.compose.BackHandler(enabled = !saving) {
+        onBackOrSave()
     }
 
     Scaffold(
