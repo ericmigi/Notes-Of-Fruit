@@ -7,6 +7,9 @@ Mac's Apple Notes and iCloud.com.
 This is a research codebase, not a polished product. Treat the README as a field
 report for the next person (or agent) who picks it up.
 
+## Screenshots
+<img height="800" alt="Screenshot_1777485511" src="https://github.com/user-attachments/assets/58914e12-889b-44f5-8515-f842d12f4ac2" />
+
 ## Install
 
 Grab a signed APK from the [Releases page](../../releases) and side-load it onto an
