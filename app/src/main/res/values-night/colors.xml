@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Splash backdrop in dark mode — match the deep warm background of the
+         Compose dark color scheme so the splash → app handoff is seamless. -->
+    <color name="splash_background">#14110A</color>
+    <color name="window_background">#14110A</color>
+</resources>

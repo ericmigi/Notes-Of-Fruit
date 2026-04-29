@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- Splash inherits the same Theme.SplashScreen parent; the night-mode
+         color resources (windowSplashScreenBackground, window_background,
+         etc.) are picked up automatically via the values-night/colors.xml
+         overrides — no separate splash style needed. -->
+
+    <style name="Theme.MyApplication" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+    </style>
+</resources>

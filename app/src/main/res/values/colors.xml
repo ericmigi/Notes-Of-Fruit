@@ -2,4 +2,7 @@
 <resources>
     <!-- Cream background that matches the launcher icon's notepad. -->
     <color name="splash_background">#FFF8E5</color>
+    <!-- Activity window background — also used as the cold-start backdrop
+         before Compose paints. values-night overrides for dark mode. -->
+    <color name="window_background">#FFFBF0</color>
 </resources>
