@@ -53,6 +53,7 @@ import androidx.compose.material.icons.filled.FormatStrikethrough
 import androidx.compose.material.icons.filled.FormatUnderlined
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.HorizontalRule
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.automirrored.filled.FormatListBulleted
 import androidx.compose.material.icons.filled.FormatListNumbered
@@ -205,6 +206,27 @@ fun AppleNotesApp() {
     var lastSavedHint by remember { mutableStateOf<String?>(null) }
     var lastSavedAtMs by remember { mutableStateOf<Long?>(null) }
     val scope = rememberCoroutineScope()
+
+    // First-launch alpha disclaimer. Block all app behaviour behind this — we
+    // don't even start the auth bootstrap until the user has acknowledged.
+    var alphaAck by remember { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(Unit) {
+        alphaAck = com.example.applenotes.AlphaWarning.isAcknowledged(context)
+    }
+    if (alphaAck == false) {
+        AlphaWarningDialog(onAcknowledge = {
+            scope.launch {
+                com.example.applenotes.AlphaWarning.acknowledge(context)
+                alphaAck = true
+            }
+        })
+        return
+    }
+    if (alphaAck == null) {
+        // Still loading the ack flag — render nothing; the splash theme is
+        // still showing underneath.
+        return
+    }
 
     LaunchedEffect(Unit) {
         // Load (or generate on first run) our stable per-device replica UUID.
@@ -1485,6 +1507,58 @@ private suspend fun decodeAttachment(
         }
     }
     return AttachmentContent.Generic(title, uti)
+}
+
+@Composable
+private fun AlphaWarningDialog(onAcknowledge: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = { /* mandatory: must tap continue */ },
+        icon = {
+            Icon(
+                imageVector = androidx.compose.material.icons.Icons.Filled.Warning,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.error,
+                modifier = Modifier.size(40.dp),
+            )
+        },
+        title = {
+            Text(
+                "Alpha — read this first",
+                style = MaterialTheme.typography.headlineSmall,
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Notes of Fruit is an unofficial, reverse-engineered, alpha-quality " +
+                        "Android client for iCloud Notes. It is not affiliated with Apple.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    "It might:",
+                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
+                )
+                Text("• corrupt, duplicate, or delete notes in your iCloud account",
+                    style = MaterialTheme.typography.bodyMedium)
+                Text("• drop formatting in subtle ways when round-tripping through Mac",
+                    style = MaterialTheme.typography.bodyMedium)
+                Text("• stop working at any time if Apple changes their API",
+                    style = MaterialTheme.typography.bodyMedium)
+                Text("• fail to handle modern collaborative notes (read-only at best)",
+                    style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    "Use at your own risk. If you have notes you can't afford to lose, " +
+                        "back them up first or just don't use this app.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onAcknowledge) {
+                Text("I understand — continue")
+            }
+        },
+    )
 }
 
 @Composable

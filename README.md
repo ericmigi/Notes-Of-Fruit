@@ -7,6 +7,35 @@ Mac's Apple Notes and iCloud.com.
 This is a research codebase, not a polished product. Treat the README as a field
 report for the next person (or agent) who picks it up.
 
+## ⚠️ Use at your own risk
+
+This is **alpha-quality software**. It might:
+
+- corrupt, duplicate, or delete notes in your iCloud account
+- drop formatting in subtle ways when round-tripping through Mac
+- stop working at any time if Apple changes their API
+- fail to handle modern collaborative notes (read-only at best)
+
+It is **unaffiliated with Apple** — it talks to Apple's CloudKit Web Services
+API as a third-party client using your own credentials. The proto formats are
+inferred by observation, not from any Apple documentation. There is no
+warranty of any kind. If you have notes you can't afford to lose, back them up
+first or just don't use this app.
+
+The first launch will block the UI behind a dialog you have to acknowledge so
+you can't say you weren't warned.
+
+## Contributing
+
+PRs and improvements are very welcome! Bug reports are OK, but I'd much rather
+have a bug report _with an associated PR fixing the issue_ 😉 — this is a
+weekend project I'm not on call for. The reverse-engineering surface area is
+huge (substring CRDT, MergeableData CRDT, table object graph, image fetch
+pipeline, paragraph + inline attribute_runs) and there's a long tail of edge
+cases waiting to be discovered. If you investigate one, please write down what
+you find in the README's relevant section so the next person doesn't have to
+rediscover it.
+
 ## Status
 
 | Capability | Status |
