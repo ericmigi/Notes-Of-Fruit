@@ -12,13 +12,20 @@ android {
         minSdk = 26
         targetSdk = 36
         versionCode = 1
-        versionName = "0.1.0"
+        versionName = "0.0.1"
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            // Sign release builds with the debug key so the APK is installable
+            // out of the GH Actions artifact without managing keystore secrets.
+            // The trade-off: a future "real" release that wants Play Store
+            // distribution must rotate to a fresh keystore, which orphans
+            // earlier installs (Android won't auto-update across keystores).
+            // That's acceptable for an alpha.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {

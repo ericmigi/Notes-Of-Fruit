@@ -7,6 +7,14 @@ Mac's Apple Notes and iCloud.com.
 This is a research codebase, not a polished product. Treat the README as a field
 report for the next person (or agent) who picks it up.
 
+## Install
+
+Grab a signed APK from the [Releases page](../../releases) and side-load it onto an
+Android 8.0+ device. Each release's notes link back to the disclaimer below;
+read it first.
+
+If you'd rather build from source, see [Build / run](#build--run) further down.
+
 ## ⚠️ Use at your own risk
 
 This is **alpha-quality software**. It might:

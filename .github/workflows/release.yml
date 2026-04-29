@@ -1,0 +1,79 @@
+name: Release APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.0.1)'
+        required: true
+        default: 'v0.0.1'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build release APK
+        run: ./gradlew :app:assembleRelease --no-daemon
+
+      - name: Rename APK
+        run: |
+          mkdir -p out
+          cp app/build/outputs/apk/release/app-release.apk \
+             out/notes-of-fruit-${{ steps.tag.outputs.name }}.apk
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: notes-of-fruit-${{ steps.tag.outputs.name }}
+          path: out/notes-of-fruit-${{ steps.tag.outputs.name }}.apk
+          if-no-files-found: error
+
+      - name: Create / update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: out/notes-of-fruit-${{ steps.tag.outputs.name }}.apk
+          body: |
+            ## ⚠️ Alpha — install at your own risk
+
+            Notes of Fruit is an unofficial, reverse-engineered Android client
+            for iCloud Notes. It might corrupt, duplicate, or delete notes in
+            your iCloud account; drop formatting in subtle ways when round-
+            tripping through Mac; or stop working at any time if Apple changes
+            their API. See the [README](https://github.com/${{ github.repository }}#%EF%B8%8F-use-at-your-own-risk).
+
+            **Install:** download `notes-of-fruit-${{ steps.tag.outputs.name }}.apk`
+            below, transfer to your Android device, and install (you may need
+            to enable "Install unknown apps" for your file manager / browser).
+            Min Android version: 8.0 (API 26).
+
+            The APK is signed with the project's debug keystore — Play Store
+            distribution will require a real keystore rotation in a future
+            release.
