@@ -17,24 +17,37 @@ report for the next person (or agent) who picks it up.
 | Read note content (decode topotext proto) | Works for `NOTE_STORE_PROTO`; not the modern `MergableData` shape |
 | Append text | Works (round-trips with Mac) |
 | Mid-text splice (insert/replace/delete) | Works (matches iCloud.com's slot-promotion pattern) |
-| Create new note (FAB → save) | Works **only with v4 UUIDs** — see "The UUID gotcha" below |
-| Auto-save on lifecycle pause | Works |
-| Share OUT (Android intent chooser) | Works (plaintext) |
-| Delete | Works (`forceDelete` removes the record entirely) |
+| Create new note (FAB → save) | Code path works (deferred-create + v4 UUID); end-to-end Mac round-trip not yet user-confirmed |
+| Auto-save on lifecycle pause | Works (lifecycle `ON_PAUSE` only — see [AppleNotesApp.kt:1052](app/src/main/java/com/example/applenotes/ui/AppleNotesApp.kt)) |
+| Share OUT (Android intent chooser) | Works (plaintext only) |
+| Delete | Uses CloudKit `forceDelete`; Mac surfaces as "Recently Deleted" (server-managed, not a hard wipe) |
 | Format display (headings, lists, checkboxes) | Decoded but not rendered yet (Phase D1 done; D2 pending) |
 | Format input toolbar | Not built |
 | Image attachments | Renders `￼` stub; no image display |
 | Conflict UX | Auto-retry on CONFLICT/oplock; no concurrent-edit merge yet |
 
-## The most important thing you'll learn here
+## The most important thing we think we learned (not yet end-to-end confirmed)
 
-**Apple's replica UUID must be RFC 4122 v4.** This is not documented anywhere.
-We spent hours diffing protos before noticing.
+**Strong hypothesis: Apple's replica UUID must be RFC 4122 v4.** This is the
+last byte-level difference between an Android-created note that got trashed
+(`ab-fresh-162944`) and an iCloud.com-created note that survived (`ic-create-test-001`).
+Both had identical proto structure, same fields, same compression. Only the
+UUID's version nibble differed.
 
-When you create a note from a foreign client, Apple Notes on Mac runs notesync,
-adds housekeeping fields, and **silently sets `Deleted=1`** if the sole replica's
-UUID isn't v4 (byte 6 high nibble = 0x4, byte 8 high two bits = 0b10). The body
-proto is left intact. The note appears in Recently Deleted within a few minutes.
+When we created a note from Android with our previous (raw-random) UUID, Mac's
+notesync added housekeeping fields, **left the body proto bytes intact**, and
+**silently set `Deleted=1`** within a few minutes — the note appeared in
+Recently Deleted on Mac. iCloud.com-created notes (which use v4 UUIDs) survive
+the same flow.
+
+**Caveat**: we shipped the v4 UUID fix in commit `3ee1a60` but haven't yet
+confirmed end-to-end that a v4-UUID-created note survives Mac quit/reopen. If
+you pick this up and v4 turns out not to be the only thing Mac validates, the
+next things to investigate are (a) the substring tree shape (iCloud.com always
+emits multiple substrings with tombstone separators around line breaks; we emit
+one substring), (b) attribute_runs count (iCloud.com splits at trailing `\n`;
+we don't), and (c) the per-replica `counter2` field (iCloud.com uses a
+non-trivial value; we use 1).
 
 `SecureRandom().nextBytes(16)` produces raw bytes — only ~1/16 chance the version
 nibble is 4. Use `java.util.UUID.randomUUID()`, or set the bits explicitly:
@@ -330,13 +343,27 @@ empty-body new-note flow). Don't relitigate without reason.
 - **No subscription / push.** Polls when the user opens the app. Background sync,
   CloudKit subscriptions, and a send queue are all unimplemented.
 
+## A note on "ENCRYPTED" field names
+
+CloudKit serializes `TitleEncrypted`, `SnippetEncrypted`, and `TextDataEncrypted`
+as `ENCRYPTED_STRING` / `ENCRYPTED_BYTES` types — but the actual byte values
+sent over the wire are just **base64-encoded UTF-8** (for Title/Snippet) and
+**gzipped protobuf** (for TextData). There is no client-side encryption layer
+involved. The names appear to be a CloudKit historical artifact; iCloud's E2EE
+("Advanced Data Protection") is a separate keystore mechanism we're not
+exercising.
+
+If you `kotlin.io.encoding.Base64.decode(titleField.value).decodeToString()`
+you get the cleartext title. That's the entire "decryption" step.
+
 ## Disclaimer
 
 This project is unaffiliated with Apple. It uses Apple's public CloudKit Web
-Services API with the user's own credentials. It does not break encryption — it
-reads notes the authenticated user already has access to. The proto formats
-were inferred from observation of the user's own data round-tripping with their
-own iCloud account; no Apple-internal documentation was consulted.
+Services API with the user's own credentials. It reads and writes notes the
+authenticated user already has access to. The proto formats were inferred from
+observation of round-tripping the user's own data through their own iCloud
+account; no Apple-internal documentation or reverse-engineered binaries were
+consulted.
 
 If you're going to publish anything based on this, be respectful. Don't redistribute
 captured proto data from other users' accounts. Don't ship anything that would
